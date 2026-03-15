@@ -330,8 +330,15 @@ class CombatObsConfig:
     max_discard_pile_cards: int = 40
     max_exhaust_pile_cards: int = 40
     max_enemies: int = 5
-    player_scalar_dim: int = 8
-    enemy_scalar_dim: int = 8
+    max_potions: int = 5
+
+    # Dims alignées avec slay_rl/features/combat_encoder.py
+    # enemy features = enemy_vocab_size + 4 + len(INTENT_TO_IDX) + 3 + 7 (avec le vocab actuel => 57)
+    # potion features = len(POTION_CLASS_TO_IDX) + 9 => 21
+    player_scalar_dim: int = 25
+    enemy_scalar_dim: int = 57
+    potion_scalar_dim: int = 21
+    combat_context_dim: int = 18
 
     @property
     def card_vocab_size(self) -> int:
@@ -436,13 +443,66 @@ class CombatCurriculumConfig:
 
 @dataclass
 class CombatRewardConfig:
-    damage_dealt_scale: float = 0.07
-    damage_taken_scale: float = -0.12
+    # Core outcome
+    damage_dealt_scale: float = 0.070
+    damage_taken_scale: float = -0.120
     kill_enemy_bonus: float = 1.25
     win_combat_bonus: float = 6.0
     lose_combat_penalty: float = -6.0
     illegal_action_penalty: float = -0.50
+
+    # Tempo / stalling
     end_turn_small_penalty: float = -0.03
+    wasted_energy_penalty_scale: float = -0.020
+    good_energy_use_reward_scale: float = 0.010
+
+    # Defensive quality
+    useful_block_scale: float = 0.012
+    overblock_penalty_scale: float = -0.004
+    survival_hp_ratio_scale: float = 0.050
+
+    # Enemy pressure / control
+    threat_reduction_scale: float = 0.030
+    enemy_vulnerable_scale: float = 0.040
+    enemy_weak_scale: float = 0.030
+
+    # Player buffs
+    strength_gain_scale: float = 0.015
+    dex_gain_scale: float = 0.010
+    metallicize_gain_scale: float = 0.008
+    plated_gain_scale: float = 0.008
+    artifact_gain_scale: float = 0.010
+    intangible_gain_scale: float = 0.040
+
+    # Setup / sequencing
+    rage_setup_scale: float = 0.030
+    double_tap_setup_scale: float = 0.080
+    inflame_setup_scale: float = 0.045
+    spot_weakness_setup_scale: float = 0.050
+    corruption_setup_scale: float = 0.060
+    barricade_setup_scale: float = 0.050
+    feel_no_pain_setup_scale: float = 0.040
+    dark_embrace_setup_scale: float = 0.035
+    demon_form_setup_scale: float = 0.070
+    evolve_setup_scale: float = 0.030
+    combust_setup_scale: float = 0.020
+    juggernaut_setup_scale: float = 0.040
+    rupture_setup_scale: float = 0.030
+
+    # Lethal / focus
+    lethal_reward_scale: float = 0.080
+    near_lethal_reward_scale: float = 0.030
+
+    # Hand pollution / self-damage
+    status_curse_hand_reduce_scale: float = 0.050
+    self_bad_hp_loss_scale: float = -0.030
+
+    # Potions
+    potion_low_threat_penalty: float = -0.020
+    potion_medium_threat_penalty: float = -0.006
+    potion_high_threat_penalty: float = -0.001
+    potion_emergency_bonus: float = 0.030
+    potion_lethal_bonus: float = 0.040
 
 
 @dataclass

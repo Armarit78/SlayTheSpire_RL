@@ -39,6 +39,23 @@ INTENT_TO_IDX = {
     "UNKNOWN": 17,
 }
 
+# Ce vocab potion n'a pas besoin d'être exhaustif au caractère près.
+# Le but ici est d'exposer une représentation stable et riche au modèle.
+POTION_CLASS_TO_IDX = {
+    "empty": 0,
+    "attack_target": 1,
+    "attack_aoe": 2,
+    "block": 3,
+    "strength": 4,
+    "dexterity": 5,
+    "draw": 6,
+    "energy": 7,
+    "artifact": 8,
+    "intangible": 9,
+    "utility": 10,
+    "unknown": 11,
+}
+
 
 def safe_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -65,6 +82,17 @@ def clamp01_from_max(value: float, max_value: float) -> float:
     if x < 0:
         return 0.0
     if x > 1:
+        return 1.0
+    return x
+
+
+def clamp_signed(value: float, abs_max: float) -> float:
+    if abs_max <= 0:
+        return 0.0
+    x = value / abs_max
+    if x < -1.0:
+        return -1.0
+    if x > 1.0:
         return 1.0
     return x
 
@@ -135,6 +163,9 @@ class CombatEncoder:
     - hand_mask:             [max_hand_cards]
     - enemies:               [max_enemies, enemy_feature_dim]
     - enemy_mask:            [max_enemies]
+    - potions:               [max_potions, potion_feature_dim]
+    - potion_mask:           [max_potions]
+    - combat_context:        [combat_context_dim]
     - deck_counts:           [card_vocab_size]
     - discard_counts:        [card_vocab_size]
     - exhaust_counts:        [card_vocab_size]
@@ -147,6 +178,7 @@ class CombatEncoder:
 
         self.max_hand_cards = self.cfg.combat_obs.max_hand_cards
         self.max_enemies = self.cfg.combat_obs.max_enemies
+        self.max_potions = self.cfg.combat_obs.max_potions
 
         self.card_vocab_size = self.cfg.combat_obs.card_vocab_size
         self.relic_vocab_size = self.cfg.combat_obs.relic_vocab_size
@@ -154,19 +186,29 @@ class CombatEncoder:
 
         self.total_actions = self.cfg.combat_action.total_actions
 
-        # Features per card in hand:
         # [card_one_hot..., cost_norm, upgraded, exhausts, ethereal, is_playable, has_target]
         self.card_feature_dim = self.card_vocab_size + 6
 
-        # Features per enemy:
-        # [enemy_one_hot..., hp_ratio, hp_abs_norm, block_norm, intent_one_hot..., intent_dmg_norm,
-        #  strength_norm, weak_norm, vulnerable_norm, alive]
+        # enemy_one_hot
+        # + hp_ratio, hp_abs_norm, block_norm, alive
+        # + intent_one_hot
+        # + intent_hit_norm, intent_total_norm, multi_count_norm
+        # + strength, weak, vulnerable, artifact, metallicize, regen, ritual
         self.enemy_feature_dim = (
             self.enemy_vocab_size
             + 4
             + len(INTENT_TO_IDX)
-            + 4
+            + 3
+            + 7
         )
+
+        # potion_class_one_hot
+        # + usable, requires_target, empty, rarity_common, rarity_uncommon, rarity_rare
+        # + is_attack_like, is_defense_like, is_buff_like
+        self.potion_feature_dim = len(POTION_CLASS_TO_IDX) + 9
+
+        # riche mais compact
+        self.combat_context_dim = self.cfg.combat_obs.combat_context_dim
 
     # ========================================================
     # Public API
@@ -176,14 +218,18 @@ class CombatEncoder:
         player = self._parse_player(state)
         hand = self._parse_hand(state)
         enemies = self._parse_enemies(state)
+
         draw_pile = self._extract_card_list(state, ["draw_pile", "drawPile"])
         discard_pile = self._extract_card_list(state, ["discard_pile", "discardPile"])
         exhaust_pile = self._extract_card_list(state, ["exhaust_pile", "exhaustPile"])
         relics = self._extract_relic_list(state)
+        potions = self._extract_potions(state)
 
-        player_scalars = self._encode_player(player)
+        player_scalars = self._encode_player(player, state, enemies, draw_pile, discard_pile, exhaust_pile, potions)
         hand_cards, hand_mask = self._encode_hand(hand)
         enemy_tensor, enemy_mask = self._encode_enemies(enemies)
+        potion_tensor, potion_mask = self._encode_potions(potions)
+        combat_context = self._encode_combat_context(state, player, enemies, hand, potions)
 
         deck_counts = self._count_cards(draw_pile)
         discard_counts = self._count_cards(discard_pile)
@@ -198,6 +244,9 @@ class CombatEncoder:
             "hand_mask": torch.tensor(hand_mask, dtype=torch.float32, device=device),
             "enemies": torch.tensor(enemy_tensor, dtype=torch.float32, device=device),
             "enemy_mask": torch.tensor(enemy_mask, dtype=torch.float32, device=device),
+            "potions": torch.tensor(potion_tensor, dtype=torch.float32, device=device),
+            "potion_mask": torch.tensor(potion_mask, dtype=torch.float32, device=device),
+            "combat_context": torch.tensor(combat_context, dtype=torch.float32, device=device),
             "deck_counts": torch.tensor(deck_counts, dtype=torch.float32, device=device),
             "discard_counts": torch.tensor(discard_counts, dtype=torch.float32, device=device),
             "exhaust_counts": torch.tensor(exhaust_counts, dtype=torch.float32, device=device),
@@ -206,10 +255,10 @@ class CombatEncoder:
         }
 
     def build_valid_action_mask(
-            self,
-            state: Dict[str, Any],
-            hand: Optional[List[ParsedCard]] = None,
-            enemies: Optional[List[ParsedEnemy]] = None,
+        self,
+        state: Dict[str, Any],
+        hand: Optional[List[ParsedCard]] = None,
+        enemies: Optional[List[ParsedEnemy]] = None,
     ) -> List[float]:
         """
         Safe action mask:
@@ -228,8 +277,7 @@ class CombatEncoder:
         targeted_size = self.max_hand_cards * self.max_enemies
         end_turn_idx = targeted_base + targeted_size
         potion_base = end_turn_idx + 1
-        potion_slots = 5
-        potion_target_base = potion_base + potion_slots
+        potion_target_base = potion_base + self.max_potions
 
         for i in range(self.max_hand_cards):
             if i < len(hand):
@@ -240,6 +288,7 @@ class CombatEncoder:
         for i in range(self.max_hand_cards):
             if i >= len(hand):
                 continue
+
             card = hand[i]
             if not card.is_playable or card.has_target != 1:
                 continue
@@ -253,7 +302,7 @@ class CombatEncoder:
             mask[end_turn_idx] = 1.0
 
         potions = self._extract_potions(state)
-        for slot_idx in range(potion_slots):
+        for slot_idx in range(self.max_potions):
             if slot_idx >= len(potions):
                 continue
 
@@ -284,15 +333,12 @@ class CombatEncoder:
 
     def _parse_player(self, state: Dict[str, Any]) -> ParsedPlayer:
         player = state.get("player", state)
-
         powers = self._extract_powers(player)
 
         hp = safe_float(player.get("current_hp", player.get("currentHealth", player.get("hp", 0))))
         max_hp = safe_float(player.get("max_hp", player.get("maxHealth", 1)))
         block = safe_float(player.get("block", player.get("currentBlock", 0)))
-        energy = safe_float(
-            player.get("energy", state.get("energy", state.get("player_energy", 0)))
-        )
+        energy = safe_float(player.get("energy", state.get("energy", state.get("player_energy", 0))))
 
         return ParsedPlayer(
             hp=hp,
@@ -319,7 +365,6 @@ class CombatEncoder:
             card_id = self._normalize_card_id(c.get("id", c.get("card_id", c.get("name", "UnknownCard"))))
             cost = safe_int(c.get("cost_for_turn", c.get("costForTurn", c.get("cost", 99))), default=99)
 
-            # Sometimes status/curses can have weird cost fields
             if cost < -1:
                 cost = -1
 
@@ -327,7 +372,6 @@ class CombatEncoder:
             exhausts = 1 if c.get("exhaust", c.get("exhausts", False)) else 0
             ethereal = 1 if c.get("isEthereal", c.get("ethereal", False)) else 0
 
-            # Best effort for "playable"
             explicitly_playable = c.get("is_playable", c.get("playable", None))
             if explicitly_playable is None:
                 is_playable = int(cost == -1 or cost <= available_energy)
@@ -398,19 +442,62 @@ class CombatEncoder:
     # Encoding
     # ========================================================
 
-    def _encode_player(self, player: ParsedPlayer) -> List[float]:
-        max_hp = max(player.max_hp, 1.0)
+    def _encode_player(
+        self,
+        player: ParsedPlayer,
+        state: Dict[str, Any],
+        enemies: List[ParsedEnemy],
+        draw_pile: List[Dict[str, Any]],
+        discard_pile: List[Dict[str, Any]],
+        exhaust_pile: List[Dict[str, Any]],
+        potions: List[Dict[str, Any]],
+    ) -> List[float]:
+        powers = self._extract_powers(player.raw)
+        combat_meta = state.get("combat_meta", {}) or {}
 
-        return [
-            clamp01_from_max(player.hp, max_hp),          # hp ratio
-            min(player.hp / 200.0, 1.0),                 # hp absolute normalized
-            min(player.block / 100.0, 1.0),              # block
-            min(player.energy / 10.0, 1.0),              # energy
-            min(max(player.strength, 0.0) / 10.0, 1.0),  # strength
-            min(max(player.dexterity, 0.0) / 10.0, 1.0), # dexterity
-            min(max(player.vulnerable, 0.0) / 5.0, 1.0), # vulnerable
-            min(max(player.frail, 0.0) / 5.0, 1.0),      # frail
+        incoming_damage = self._estimate_incoming_damage_from_parsed_enemies(enemies)
+        alive_enemies = sum(e.alive for e in enemies)
+        usable_potions = sum(
+            1 for p in potions
+            if not p.get("empty", False) and p.get("usable", True)
+        )
+
+        out = [
+            clamp01_from_max(player.hp, max(player.max_hp, 1.0)),             # 0
+            min(player.hp / 200.0, 1.0),                                      # 1
+            min(player.block / 120.0, 1.0),                                   # 2
+            min(player.energy / 10.0, 1.0),                                   # 3
+            clamp_signed(player.strength, 20.0),                              # 4
+            clamp_signed(player.dexterity, 20.0),                             # 5
+            min(max(player.weak, 0.0) / 6.0, 1.0),                            # 6
+            min(max(player.vulnerable, 0.0) / 6.0, 1.0),                      # 7
+            min(max(player.frail, 0.0) / 6.0, 1.0),                           # 8
+            min(max(self._power_amount(powers, ["Artifact"]), 0.0) / 5.0, 1.0),      # 9
+            min(max(self._power_amount(powers, ["Metallicize"]), 0.0) / 10.0, 1.0),   # 10
+            min(max(self._power_amount(powers, ["Plated Armor"]), 0.0) / 10.0, 1.0),  # 11
+            min(max(self._power_amount(powers, ["Rage"]), 0.0) / 10.0, 1.0),          # 12
+            min(max(self._power_amount(powers, ["Combust"]), 0.0) / 12.0, 1.0),       # 13
+            min(max(self._power_amount(powers, ["Dark Embrace"]), 0.0) / 3.0, 1.0),   # 14
+            min(max(self._power_amount(powers, ["Evolve"]), 0.0) / 3.0, 1.0),          # 15
+            min(max(self._power_amount(powers, ["Feel No Pain"]), 0.0) / 8.0, 1.0),    # 16
+            min(max(self._power_amount(powers, ["Fire Breathing"]), 0.0) / 12.0, 1.0), # 17
+            min(max(self._power_amount(powers, ["Rupture"]), 0.0) / 5.0, 1.0),         # 18
+            min(max(self._power_amount(powers, ["Juggernaut"]), 0.0) / 12.0, 1.0),     # 19
+            1.0 if self._has_power(powers, "Barricade") else 0.0,                       # 20
+            1.0 if self._has_power(powers, "Corruption") else 0.0,                      # 21
+            min(max(combat_meta.get("double_tap_charges", 0), 0) / 3.0, 1.0),          # 22
+            min(incoming_damage / 60.0, 1.0),                                            # 23
+            min(alive_enemies / max(self.max_enemies, 1), 1.0),                          # 24
         ]
+
+        # garde la taille sous contrôle si config diverge
+        if len(out) != self.cfg.combat_obs.player_scalar_dim:
+            raise ValueError(
+                f"player_scalars dim mismatch: got {len(out)}, "
+                f"expected {self.cfg.combat_obs.player_scalar_dim}"
+            )
+
+        return out
 
     def _encode_hand(self, hand: List[ParsedCard]) -> Tuple[List[List[float]], List[float]]:
         rows: List[List[float]] = []
@@ -452,100 +539,228 @@ class CombatEncoder:
             enemy_idx = ENEMY_TO_IDX.get(enemy.name, -1)
             enemy_one_hot = one_hot(enemy_idx, self.enemy_vocab_size)
 
-            intent_one_hot = one_hot(INTENT_TO_IDX.get(enemy.intent, INTENT_TO_IDX["UNKNOWN"]), len(INTENT_TO_IDX))
+            intent_one_hot = one_hot(
+                INTENT_TO_IDX.get(enemy.intent, INTENT_TO_IDX["UNKNOWN"]),
+                len(INTENT_TO_IDX),
+            )
+
+            powers = self._extract_powers(enemy.raw)
+
+            intent_hits = self._extract_enemy_intent_hits(enemy.raw)
+            intent_total_damage = max(0.0, enemy.intent_base_damage * intent_hits)
 
             max_hp = max(enemy.max_hp, 1.0)
             row = enemy_one_hot + [
                 clamp01_from_max(enemy.hp, max_hp),
                 min(enemy.hp / 250.0, 1.0),
-                min(enemy.block / 100.0, 1.0),
+                min(enemy.block / 120.0, 1.0),
                 1.0 if enemy.alive else 0.0,
             ] + intent_one_hot + [
-                min(enemy.intent_base_damage / 50.0, 1.0),
-                min(max(enemy.strength, 0.0) / 10.0, 1.0),
-                min(max(enemy.weak, 0.0) / 5.0, 1.0),
-                min(max(enemy.vulnerable, 0.0) / 5.0, 1.0),
+                min(enemy.intent_base_damage / 40.0, 1.0),
+                min(intent_total_damage / 80.0, 1.0),
+                min(intent_hits / 6.0, 1.0),
+                clamp_signed(enemy.strength, 20.0),
+                min(max(enemy.weak, 0.0) / 6.0, 1.0),
+                min(max(enemy.vulnerable, 0.0) / 6.0, 1.0),
+                min(max(self._power_amount(powers, ["Artifact"]), 0.0) / 5.0, 1.0),
+                min(max(self._power_amount(powers, ["Metallicize"]), 0.0) / 10.0, 1.0),
+                min(max(self._power_amount(powers, ["Regenerate", "Regen"]), 0.0) / 15.0, 1.0),
+                min(max(self._power_amount(powers, ["Ritual"]), 0.0) / 10.0, 1.0),
             ]
 
             rows.append(row)
-            mask.append(1.0)
+            mask.append(1.0 if enemy.alive else 0.0)
 
         while len(rows) < self.max_enemies:
             rows.append([0.0] * self.enemy_feature_dim)
             mask.append(0.0)
 
+        if len(rows[0]) != self.cfg.combat_obs.enemy_scalar_dim:
+            raise ValueError(
+                f"enemy feature dim mismatch: got {len(rows[0])}, "
+                f"expected {self.cfg.combat_obs.enemy_scalar_dim}"
+            )
+
         return rows, mask
+
+    def _encode_potions(self, potions: List[Dict[str, Any]]) -> Tuple[List[List[float]], List[float]]:
+        rows: List[List[float]] = []
+        mask: List[float] = []
+
+        for potion in potions[: self.max_potions]:
+            potion_class = self._classify_potion(potion)
+            potion_idx = POTION_CLASS_TO_IDX.get(potion_class, POTION_CLASS_TO_IDX["unknown"])
+            one_hot_class = one_hot(potion_idx, len(POTION_CLASS_TO_IDX))
+
+            rarity = str(potion.get("rarity", "Common")).lower()
+            usable = 1.0 if potion.get("usable", True) and not potion.get("empty", False) else 0.0
+            requires_target = 1.0 if potion.get("requires_target", False) else 0.0
+            empty = 1.0 if potion.get("empty", False) else 0.0
+
+            is_attack_like = 1.0 if potion_class in {"attack_target", "attack_aoe"} else 0.0
+            is_defense_like = 1.0 if potion_class == "block" else 0.0
+            is_buff_like = 1.0 if potion_class in {
+                "strength", "dexterity", "artifact", "intangible", "energy", "draw", "utility"
+            } else 0.0
+
+            row = one_hot_class + [
+                usable,
+                requires_target,
+                empty,
+                1.0 if rarity == "common" else 0.0,
+                1.0 if rarity == "uncommon" else 0.0,
+                1.0 if rarity == "rare" else 0.0,
+                is_attack_like,
+                is_defense_like,
+                is_buff_like,
+            ]
+
+            rows.append(row)
+            mask.append(0.0 if empty else 1.0)
+
+        while len(rows) < self.max_potions:
+            rows.append([0.0] * self.potion_feature_dim)
+            mask.append(0.0)
+
+        if len(rows[0]) != self.cfg.combat_obs.potion_scalar_dim:
+            raise ValueError(
+                f"potion feature dim mismatch: got {len(rows[0])}, "
+                f"expected {self.cfg.combat_obs.potion_scalar_dim}"
+            )
+
+        return rows, mask
+
+    def _encode_combat_context(
+        self,
+        state: Dict[str, Any],
+        player: ParsedPlayer,
+        enemies: List[ParsedEnemy],
+        hand: List[ParsedCard],
+        potions: List[Dict[str, Any]],
+    ) -> List[float]:
+        combat_meta = state.get("combat_meta", {}) or {}
+
+        alive_enemies = [e for e in enemies if e.alive]
+        incoming_damage = self._estimate_incoming_damage_from_parsed_enemies(enemies)
+        attacks_in_hand = sum(1 for c in hand if self._card_type(c.raw) == "ATTACK")
+        skills_in_hand = sum(1 for c in hand if self._card_type(c.raw) == "SKILL")
+        powers_in_hand = sum(1 for c in hand if self._card_type(c.raw) == "POWER")
+        playable_cards = sum(1 for c in hand if c.is_playable)
+        targeted_cards = sum(1 for c in hand if c.has_target)
+        usable_potions = sum(
+            1 for p in potions
+            if not p.get("empty", False) and p.get("usable", True)
+        )
+
+        lethalable_enemies = 0
+        estimated_best_single_hit = self._estimate_best_single_target_damage(hand, player)
+        for enemy in alive_enemies:
+            effective_hp = enemy.hp + enemy.block
+            if estimated_best_single_hit >= effective_hp:
+                lethalable_enemies += 1
+
+        context = [
+            min(safe_float(state.get("turn", 1)) / 20.0, 1.0),                                  # 0
+            min(max(combat_meta.get("cards_played_this_turn", 0), 0) / 10.0, 1.0),            # 1
+            min(max(combat_meta.get("attacks_played_this_turn", 0), 0) / 10.0, 1.0),          # 2
+            min(max(combat_meta.get("attack_counter", 0), 0) / 20.0, 1.0),                    # 3
+            min(max(combat_meta.get("double_tap_charges", 0), 0) / 3.0, 1.0),                 # 4
+            min(max(combat_meta.get("last_x_energy_spent", 0), 0) / 5.0, 1.0),                # 5
+            1.0 if combat_meta.get("cannot_draw_more_this_turn", False) else 0.0,             # 6
+            1.0 if combat_meta.get("next_attack_double", False) else 0.0,                      # 7
+            1.0 if combat_meta.get("first_attack_done", False) else 0.0,                       # 8
+            1.0 if combat_meta.get("is_elite", False) else 0.0,                                # 9
+            1.0 if combat_meta.get("is_boss", False) else 0.0,                                 # 10
+            min(incoming_damage / 80.0, 1.0),                                                  # 11
+            min(len(alive_enemies) / max(self.max_enemies, 1), 1.0),                           # 12
+            min(attacks_in_hand / max(self.max_hand_cards, 1), 1.0),                           # 13
+            min(skills_in_hand / max(self.max_hand_cards, 1), 1.0),                            # 14
+            min(powers_in_hand / max(self.max_hand_cards, 1), 1.0),                            # 15
+            min(playable_cards / max(self.max_hand_cards, 1), 1.0),                            # 16
+            min(usable_potions / max(self.max_potions, 1), 1.0),                               # 17
+        ]
+
+        if len(context) != self.combat_context_dim:
+            raise ValueError(
+                f"combat_context dim mismatch: got {len(context)}, expected {self.combat_context_dim}"
+            )
+
+        return context
+
+    # ========================================================
+    # Counts / bag-of-cards
+    # ========================================================
 
     def _count_cards(self, cards: List[Dict[str, Any]]) -> List[float]:
         counts = [0.0] * self.card_vocab_size
         for c in cards:
-            card_id = self._normalize_card_id(c.get("id", c.get("card_id", c.get("name", "UnknownCard"))))
-            idx = CARD_TO_IDX.get(card_id)
-            if idx is not None:
+            card_id = self._normalize_card_id(c.get("id", c.get("card_id", c.get("name", ""))))
+            idx = CARD_TO_IDX.get(card_id, -1)
+            if 0 <= idx < self.card_vocab_size:
                 counts[idx] += 1.0
 
-        # Soft normalize
-        total = sum(counts)
-        if total > 0:
-            counts = [min(x / total, 1.0) for x in counts]
-
-        return counts
+        # soft cap to keep the scale bounded
+        return [min(x / 8.0, 1.0) for x in counts]
 
     def _encode_relics(self, relics: List[Dict[str, Any]]) -> List[float]:
         vec = [0.0] * self.relic_vocab_size
-
         for relic in relics:
-            relic_name = self._extract_relic_name(relic)
-            idx = RELIC_TO_IDX.get(relic_name)
-            if idx is not None:
+            name = self._extract_relic_name(relic)
+            idx = RELIC_TO_IDX.get(name, -1)
+            if 0 <= idx < self.relic_vocab_size:
                 vec[idx] = 1.0
-
         return vec
 
-    def _normalize_relic_name_text(self, name: str) -> str:
-        return str(name or "").strip()
+    # ========================================================
+    # Tactical estimates
+    # ========================================================
 
-    def _canonicalize_relic_name(self, name: str) -> str:
-        raw = self._normalize_relic_name_text(name)
+    def _estimate_incoming_damage_from_parsed_enemies(self, enemies: List[ParsedEnemy]) -> float:
+        total = 0.0
+        for enemy in enemies:
+            if not enemy.alive:
+                continue
+            hits = self._extract_enemy_intent_hits(enemy.raw)
+            total += max(0.0, enemy.intent_base_damage) * hits
+        return total
 
-        alias_map = {
-            "Paper Frog": "Paper Phrog",
-            "Paper Phrog": "Paper Phrog",
+    def _estimate_best_single_target_damage(self, hand: List[ParsedCard], player: ParsedPlayer) -> float:
+        best = 0.0
+        strength = player.strength
 
-            "Cultist Mask": "Cultist Headpiece",
-            "Cultist Headpiece": "Cultist Headpiece",
+        for card in hand:
+            if not card.is_playable:
+                continue
 
-            "Gremlin Mask": "Gremlin Visage",
-            "Gremlin Visage": "Gremlin Visage",
+            raw = card.raw
+            card_type = self._card_type(raw)
+            if card_type != "ATTACK":
+                continue
 
-            "Captain wheel": "Captain's Wheel",
-            "Captain's Wheel": "Captain's Wheel",
+            base = safe_float(raw.get("damage", 0))
+            hits = safe_float(raw.get("hits", 1))
 
-            "Wing Boots": "Winged Greaves",
-            "Winged Greaves": "Winged Greaves",
+            # très simple mais utile
+            if raw.get("damage_from_block", False):
+                est = player.block
+            elif raw.get("strength_mult") is not None:
+                est = base + strength * safe_float(raw.get("strength_mult", 1))
+            elif raw.get("damage_per_exhausted_card") is not None:
+                # estimation prudente
+                est = safe_float(raw.get("damage_per_exhausted_card", 0)) * 3.0
+            else:
+                est = (base + strength) * max(hits, 1.0)
 
-            "Sling": "Sling of Courage",
-            "Sling of Courage": "Sling of Courage",
+            best = max(best, est)
 
-            "Nloth's Gift": "N'loth's Gift",
-            "N'loth's Gift": "N'loth's Gift",
+        return best
 
-            "Boot": "The Boot",
-            "The Boot": "The Boot",
-        }
-
-        return alias_map.get(raw, raw)
-
-    def _extract_relic_name(self, relic: Dict[str, Any]) -> str:
-        raw_name = relic.get("name", relic.get("id", ""))
-        return self._canonicalize_relic_name(str(raw_name))
-
-    def _has_relic_name(self, relics: List[Dict[str, Any]], relic_name: str) -> bool:
-        target = self._canonicalize_relic_name(relic_name)
-        for relic in relics:
-            if self._extract_relic_name(relic) == target:
-                return True
-        return False
+    def _extract_enemy_intent_hits(self, enemy_raw: Dict[str, Any]) -> float:
+        for key in ["intent_hits", "intentHits", "move_hits", "hits", "multi"]:
+            if key in enemy_raw:
+                hits = safe_float(enemy_raw.get(key, 1.0), 1.0)
+                return max(1.0, hits)
+        return 1.0
 
     # ========================================================
     # Extraction helpers
@@ -556,7 +771,6 @@ class CombatEncoder:
             if key in state and isinstance(state[key], list):
                 return state[key]
 
-        # Sometimes nested under player
         player = state.get("player", {})
         for key in keys:
             if key in player and isinstance(player[key], list):
@@ -603,21 +817,60 @@ class CombatEncoder:
             if power_name in {x.lower() for x in names}:
                 total += safe_float(p.get("amount", p.get("stack", 0)))
             else:
-                # More permissive substring match
                 for n in target_names:
                     if n in power_name:
                         total += safe_float(p.get("amount", p.get("stack", 0)))
                         break
         return total
 
+    def _has_power(self, powers: List[Dict[str, Any]], name: str) -> bool:
+        target = name.lower()
+        for p in powers:
+            power_name = str(p.get("id", p.get("name", ""))).lower()
+            if power_name == target or target in power_name:
+                return True
+        return False
+
+    def _extract_relic_name(self, relic: Dict[str, Any]) -> str:
+        return str(relic.get("name", relic.get("id", "UnknownRelic")))
+
+    def _classify_potion(self, potion: Dict[str, Any]) -> str:
+        if potion.get("empty", False):
+            return "empty"
+
+        name = str(potion.get("name", potion.get("id", "Potion"))).lower()
+        requires_target = bool(potion.get("requires_target", False))
+
+        if "fire potion" in name or "poison potion" in name or "fear potion" in name or "explosive" in name:
+            return "attack_target" if requires_target else "attack_aoe"
+        if "block" in name or "dexterity" in name or "essence of steel" in name:
+            return "block"
+        if "strength" in name or "cultist potion" in name:
+            return "strength"
+        if "swift potion" in name or "gamblers brew" in name:
+            return "draw"
+        if "energy" in name:
+            return "energy"
+        if "artifact" in name:
+            return "artifact"
+        if "ghost" in name:
+            return "intangible"
+        if "dexterity" in name:
+            return "dexterity"
+        if "power potion" in name or "skill potion" in name or "attack potion" in name or "potion" in name:
+            return "utility"
+
+        if requires_target:
+            return "attack_target"
+
+        return "unknown"
+
     def _normalize_card_id(self, raw_id: str) -> str:
         card_id = str(raw_id).strip()
 
-        # Some connectors might use spaces or lowercase names
         if card_id in CARD_TO_IDX:
             return card_id
 
-        # Best effort normalization
         candidates = [
             card_id.replace(" ", "_"),
             card_id.replace("_", " "),
@@ -629,68 +882,101 @@ class CombatEncoder:
 
         return card_id
 
+    def _card_type(self, card: Dict[str, Any]) -> str:
+        return str(card.get("type", "")).upper()
+
     def _card_has_target(self, card: Dict[str, Any]) -> int:
         """
         Best effort target inference.
-        Many attack cards target one enemy, but some attacks hit all enemies.
-        Some skill/power cards do not target.
         """
-        # Explicit metadata first
         if "has_target" in card:
             return 1 if card["has_target"] else 0
+
         if "target" in card:
             target = str(card["target"]).upper()
-            if target in {"ENEMY", "SELF_AND_ENEMY"}:
+            if target in {"ENEMY", "SINGLE", "MONSTER"}:
                 return 1
-            if target in {"ALL_ENEMY", "SELF", "NONE", "ALL"}:
+            if target in {"ALL", "SELF", "NONE"}:
                 return 0
 
-        card_id = self._normalize_card_id(card.get("id", card.get("name", "")))
+        if card.get("targeted", False):
+            return 1
+        if card.get("aoe_damage", None) is not None:
+            return 0
+        if card.get("apply_weak_all", None) is not None:
+            return 0
+        if card.get("apply_vulnerable_all", None) is not None:
+            return 0
+        if card.get("x_aoe_damage", None) is not None:
+            return 0
+
+        card_id = self._normalize_card_id(card.get("id", card.get("card_id", card.get("name", ""))))
 
         known_target_cards = {
+            "Strike_R",
             "Bash",
             "Body Slam",
             "Clash",
+            "Clothesline",
+            "Headbutt",
             "Heavy Blade",
+            "Iron Wave",
+            "Perfected Strike",
             "Pommel Strike",
-            "Sword Boomerang",
-            "Thunderclap",
+            "Twin Strike",
+            "Wild Strike",
+            "Blood for Blood",
             "Carnage",
             "Disarm",
             "Dropkick",
             "Hemokinesis",
             "Pummel",
+            "Rampage",
             "Reckless Charge",
+            "Searing Blow",
+            "Sever Soul",
+            "Spot Weakness",
             "Uppercut",
             "Bludgeon",
             "Feed",
+            "Fiend Fire",
         }
 
         known_no_target_cards = {
             "Defend_R",
+            "Anger",
             "Armaments",
             "Cleave",
             "Flex",
-            "Ghostly Armor",
-            "Inflame",
+            "Havoc",
             "Shrug It Off",
+            "Sword Boomerang",
+            "Thunderclap",
+            "True Grit",
             "Warcry",
-            "Whirlwind",
             "Battle Trance",
             "Bloodletting",
+            "Burning Pact",
             "Combust",
+            "Dark Embrace",
+            "Dual Wield",
             "Entrench",
             "Evolve",
             "Feel No Pain",
             "Fire Breathing",
             "Flame Barrier",
+            "Ghostly Armor",
             "Infernal Blade",
+            "Inflame",
+            "Intimidate",
             "Metallicize",
             "Power Through",
             "Rage",
+            "Rupture",
             "Second Wind",
             "Seeing Red",
             "Shockwave",
+            "Whirlwind",
             "Barricade",
             "Berserk",
             "Brutality",
@@ -698,7 +984,6 @@ class CombatEncoder:
             "Demon Form",
             "Double Tap",
             "Exhume",
-            "Fiend Fire",
             "Immolate",
             "Impervious",
             "Juggernaut",
@@ -712,8 +997,7 @@ class CombatEncoder:
         if card_id in known_no_target_cards:
             return 0
 
-        # Fallback heuristic from type/name
-        card_type = str(card.get("type", "")).upper()
+        card_type = self._card_type(card)
         if card_type == "ATTACK":
             return 1
 
@@ -743,8 +1027,6 @@ class CombatEncoder:
 def flatten_combat_obs(encoded: Dict[str, torch.Tensor]) -> torch.Tensor:
     """
     Turn the structured encoded dict into a single 1D tensor.
-
-    This is useful for a first MLP-based combat model.
     """
     parts = [
         encoded["player_scalars"].flatten(),
@@ -752,6 +1034,9 @@ def flatten_combat_obs(encoded: Dict[str, torch.Tensor]) -> torch.Tensor:
         encoded["hand_mask"].flatten(),
         encoded["enemies"].flatten(),
         encoded["enemy_mask"].flatten(),
+        encoded["potions"].flatten(),
+        encoded["potion_mask"].flatten(),
+        encoded["combat_context"].flatten(),
         encoded["deck_counts"].flatten(),
         encoded["discard_counts"].flatten(),
         encoded["exhaust_counts"].flatten(),
@@ -769,6 +1054,7 @@ if __name__ == "__main__":
     encoder = CombatEncoder(cfg)
 
     sample_state = {
+        "turn": 2,
         "energy": 3,
         "player": {
             "current_hp": 72,
@@ -777,6 +1063,8 @@ if __name__ == "__main__":
             "powers": [
                 {"id": "Strength", "amount": 2},
                 {"id": "Dexterity", "amount": 1},
+                {"id": "Artifact", "amount": 1},
+                {"id": "Rage", "amount": 3},
             ],
             "relics": [
                 {"name": "Burning Blood"},
@@ -796,6 +1084,18 @@ if __name__ == "__main__":
         ],
         "discard_pile": [],
         "exhaust_pile": [],
+        "combat_meta": {
+            "cards_played_this_turn": 1,
+            "attacks_played_this_turn": 1,
+            "double_tap_charges": 0,
+            "cannot_draw_more_this_turn": False,
+            "last_x_energy_spent": 0,
+            "attack_counter": 1,
+            "next_attack_double": False,
+            "first_attack_done": True,
+            "is_elite": False,
+            "is_boss": False,
+        },
         "monsters": [
             {
                 "name": "Jaw Worm",
@@ -813,12 +1113,13 @@ if __name__ == "__main__":
                 "block": 0,
                 "intent": "BUFF",
                 "intent_base_damage": 0,
-                "powers": [],
+                "powers": [{"id": "Ritual", "amount": 3}],
             },
         ],
         "potions": [
-            {"name": "Fire Potion", "usable": True, "empty": False},
-            {"name": "Empty Slot", "usable": False, "empty": True},
+            {"name": "Fire Potion", "usable": True, "empty": False, "requires_target": True, "rarity": "Common"},
+            {"name": "Dexterity Potion", "usable": True, "empty": False, "requires_target": False, "rarity": "Uncommon"},
+            {"name": "Empty Slot", "usable": False, "empty": True, "requires_target": False},
         ],
     }
 

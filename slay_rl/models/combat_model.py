@@ -7,11 +7,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from slay_rl.config import Config, get_default_config
-from slay_rl.features.combat_encoder import CombatEncoder, flatten_combat_obs
+from slay_rl.features.combat_encoder import CombatEncoder
 
 
 LOGIT_NEG = -1e9
 
+
+# =========================================================
+# Basic blocks
+# =========================================================
 
 class MLPBlock(nn.Module):
     def __init__(self, in_dim: int, out_dim: int, dropout: float = 0.0):
@@ -28,48 +32,156 @@ class MLPBlock(nn.Module):
         return x
 
 
+class SlotEncoder(nn.Module):
+    """
+    Encode per-slot features (cards, enemies, potions).
+    Input:  [B, N, D]
+    Output: [B, N, H]
+    """
+    def __init__(self, in_dim: int, hidden_dim: int, dropout: float = 0.0):
+        super().__init__()
+        self.net = nn.Sequential(
+            MLPBlock(in_dim, hidden_dim, dropout=dropout),
+            MLPBlock(hidden_dim, hidden_dim, dropout=dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, n, d = x.shape
+        x = x.view(b * n, d)
+        x = self.net(x)
+        x = x.view(b, n, -1)
+        return x
+
+
+class ScalarEncoder(nn.Module):
+    """
+    Encode single-vector features.
+    Input:  [B, D]
+    Output: [B, H]
+    """
+    def __init__(self, in_dim: int, hidden_dim: int, dropout: float = 0.0):
+        super().__init__()
+        self.net = nn.Sequential(
+            MLPBlock(in_dim, hidden_dim, dropout=dropout),
+            MLPBlock(hidden_dim, hidden_dim, dropout=dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class MaskedMeanPool(nn.Module):
+    """
+    Mean pool with binary mask.
+    values: [B, N, H]
+    mask:   [B, N]
+    out:    [B, H]
+    """
+    def forward(self, values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        mask = mask.float().unsqueeze(-1)  # [B, N, 1]
+        weighted = values * mask
+        denom = mask.sum(dim=1).clamp_min(1.0)
+        return weighted.sum(dim=1) / denom
+
+
+class MaskedMaxPool(nn.Module):
+    """
+    Max pool with binary mask.
+    values: [B, N, H]
+    mask:   [B, N]
+    out:    [B, H]
+    """
+    def forward(self, values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        mask = mask.float().unsqueeze(-1)  # [B, N, 1]
+        neg = torch.full_like(values, -1e9)
+        masked_values = torch.where(mask > 0.0, values, neg)
+        pooled = masked_values.max(dim=1).values
+
+        # si tout est masqué, on renvoie 0
+        no_valid = (mask.sum(dim=1) <= 0.0).expand_as(pooled)
+        pooled = torch.where(no_valid, torch.zeros_like(pooled), pooled)
+        return pooled
+
+
+# =========================================================
+# Structured combat model
+# =========================================================
+
 class CombatModel(nn.Module):
     """
-    PPO-style combat network.
+    Structured PPO combat network.
 
-    Input:
-        encoded obs dict from CombatEncoder
-
-    Output:
-        {
-            "logits": [B, total_actions],
-            "value":  [B],
-            "probs":  [B, total_actions] (optional helper)
-        }
+    Instead of flattening everything immediately, this model:
+    - encodes player scalars
+    - encodes combat context
+    - encodes deck/discard/exhaust/relic summary
+    - encodes hand slots separately
+    - encodes enemy slots separately
+    - encodes potion slots separately
+    - pools slot groups with masks
+    - fuses everything into a shared combat representation
     """
 
     def __init__(
         self,
         cfg: Optional[Config] = None,
-        hidden_dim: int = 512,
+        hidden_dim: int = 384,
+        slot_hidden_dim: int = 192,
         dropout: float = 0.1,
     ):
         super().__init__()
         self.cfg = cfg or get_default_config()
         self.encoder = CombatEncoder(self.cfg)
-
-        self.obs_dim = self._infer_obs_dim()
         self.total_actions = self.cfg.combat_action.total_actions
 
-        # Shared torso
-        self.backbone = nn.Sequential(
-            MLPBlock(self.obs_dim, hidden_dim, dropout=dropout),
+        # dims from encoder/config
+        self.player_dim = self.cfg.combat_obs.player_scalar_dim
+        self.enemy_dim = self.cfg.combat_obs.enemy_scalar_dim
+        self.potion_dim = self.cfg.combat_obs.potion_scalar_dim
+        self.context_dim = self.cfg.combat_obs.combat_context_dim
+
+        self.hand_dim = self.encoder.card_feature_dim
+        self.deck_dim = self.cfg.combat_obs.card_vocab_size
+        self.relic_dim = self.cfg.combat_obs.relic_vocab_size
+
+        # scalar/global encoders
+        self.player_encoder = ScalarEncoder(self.player_dim, hidden_dim, dropout=dropout)
+        self.context_encoder = ScalarEncoder(self.context_dim, hidden_dim, dropout=dropout)
+
+        self.piles_encoder = ScalarEncoder(
+            self.deck_dim * 3 + self.relic_dim,
+            hidden_dim,
+            dropout=dropout,
+        )
+
+        # slot encoders
+        self.hand_encoder = SlotEncoder(self.hand_dim, slot_hidden_dim, dropout=dropout)
+        self.enemy_encoder = SlotEncoder(self.enemy_dim, slot_hidden_dim, dropout=dropout)
+        self.potion_encoder = SlotEncoder(self.potion_dim, slot_hidden_dim, dropout=dropout)
+
+        # pooling
+        self.mean_pool = MaskedMeanPool()
+        self.max_pool = MaskedMaxPool()
+
+        # project pooled slot groups into common hidden space
+        self.hand_pool_proj = ScalarEncoder(slot_hidden_dim * 2, hidden_dim, dropout=dropout)
+        self.enemy_pool_proj = ScalarEncoder(slot_hidden_dim * 2, hidden_dim, dropout=dropout)
+        self.potion_pool_proj = ScalarEncoder(slot_hidden_dim * 2, hidden_dim, dropout=dropout)
+
+        # fusion
+        fusion_in_dim = hidden_dim * 6
+        self.fusion = nn.Sequential(
+            MLPBlock(fusion_in_dim, hidden_dim, dropout=dropout),
             MLPBlock(hidden_dim, hidden_dim, dropout=dropout),
             MLPBlock(hidden_dim, hidden_dim, dropout=dropout),
         )
 
-        # Policy head
+        # heads
         self.policy_head = nn.Sequential(
             MLPBlock(hidden_dim, hidden_dim // 2, dropout=dropout),
             nn.Linear(hidden_dim // 2, self.total_actions),
         )
 
-        # Value head
         self.value_head = nn.Sequential(
             MLPBlock(hidden_dim, hidden_dim // 2, dropout=dropout),
             nn.Linear(hidden_dim // 2, 1),
@@ -95,10 +207,53 @@ class CombatModel(nn.Module):
             value:  [B]
             probs:  [B, A]
         """
-        flat_obs = self._flatten_batch(encoded_obs)
-        valid_action_mask = self._extract_action_mask(encoded_obs)
+        obs = self._ensure_batched(encoded_obs)
 
-        features = self.backbone(flat_obs)
+        valid_action_mask = self._extract_action_mask(obs)
+
+        player_repr = self.player_encoder(obs["player_scalars"])
+        context_repr = self.context_encoder(obs["combat_context"])
+
+        piles_input = torch.cat(
+            [
+                obs["deck_counts"],
+                obs["discard_counts"],
+                obs["exhaust_counts"],
+                obs["relics"],
+            ],
+            dim=-1,
+        )
+        piles_repr = self.piles_encoder(piles_input)
+
+        hand_repr = self.hand_encoder(obs["hand_cards"])
+        enemy_repr = self.enemy_encoder(obs["enemies"])
+        potion_repr = self.potion_encoder(obs["potions"])
+
+        hand_mean = self.mean_pool(hand_repr, obs["hand_mask"])
+        hand_max = self.max_pool(hand_repr, obs["hand_mask"])
+        hand_summary = self.hand_pool_proj(torch.cat([hand_mean, hand_max], dim=-1))
+
+        enemy_mean = self.mean_pool(enemy_repr, obs["enemy_mask"])
+        enemy_max = self.max_pool(enemy_repr, obs["enemy_mask"])
+        enemy_summary = self.enemy_pool_proj(torch.cat([enemy_mean, enemy_max], dim=-1))
+
+        potion_mean = self.mean_pool(potion_repr, obs["potion_mask"])
+        potion_max = self.max_pool(potion_repr, obs["potion_mask"])
+        potion_summary = self.potion_pool_proj(torch.cat([potion_mean, potion_max], dim=-1))
+
+        fused = torch.cat(
+            [
+                player_repr,
+                context_repr,
+                piles_repr,
+                hand_summary,
+                enemy_summary,
+                potion_summary,
+            ],
+            dim=-1,
+        )
+
+        features = self.fusion(fused)
         raw_logits = self.policy_head(features)
         masked_logits = self._apply_action_mask(raw_logits, valid_action_mask)
 
@@ -121,16 +276,6 @@ class CombatModel(nn.Module):
         encoded_obs: Dict[str, torch.Tensor],
         deterministic: bool = False,
     ) -> Dict[str, torch.Tensor]:
-        """
-        Returns:
-            {
-                "action": [B],
-                "log_prob": [B],
-                "value": [B],
-                "logits": [B, A],
-                "probs": [B, A],
-            }
-        """
         outputs = self.forward(encoded_obs)
         logits = outputs["logits"]
         value = outputs["value"]
@@ -158,21 +303,6 @@ class CombatModel(nn.Module):
         encoded_obs: Dict[str, torch.Tensor],
         actions: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        """
-        For PPO training.
-
-        Args:
-            encoded_obs: batch of encoded observations
-            actions: [B]
-
-        Returns:
-            {
-                "log_prob": [B],
-                "entropy": [B],
-                "value": [B],
-                "logits": [B, A],
-            }
-        """
         outputs = self.forward(encoded_obs)
         logits = outputs["logits"]
         value = outputs["value"]
@@ -214,65 +344,38 @@ class CombatModel(nn.Module):
     # Internal helpers
     # =========================================================
 
-    def _infer_obs_dim(self) -> int:
-        sample_state = {
-            "energy": 3,
-            "player": {
-                "current_hp": 70,
-                "max_hp": 80,
-                "block": 0,
-                "powers": [],
-                "relics": [{"name": "Burning Blood"}],
-            },
-            "hand": [
-                {"id": "Strike_R", "cost": 1, "type": "ATTACK"},
-                {"id": "Defend_R", "cost": 1, "type": "SKILL"},
-            ],
-            "draw_pile": [{"id": "Bash"}],
-            "discard_pile": [],
-            "exhaust_pile": [],
-            "monsters": [
-                {
-                    "name": "Jaw Worm",
-                    "current_hp": 40,
-                    "max_hp": 42,
-                    "block": 0,
-                    "intent": "ATTACK",
-                    "intent_base_damage": 11,
-                    "powers": [],
-                }
-            ],
-            "potions": [],
-        }
-        encoded = self.encoder.encode(sample_state, device="cpu")
-        flat = flatten_combat_obs(encoded)
-        return int(flat.shape[0])
-
-    def _flatten_batch(self, encoded_obs: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def _ensure_batched(self, encoded_obs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
-        Convert encoded dict to [B, obs_dim].
+        Convert encoded dict to batched tensors.
         """
-        sample_tensor = encoded_obs["player_scalars"]
-
-        # Unbatched case
-        if sample_tensor.dim() == 1:
-            flat = flatten_combat_obs(encoded_obs).unsqueeze(0)
-            return flat
-
-        # Batched case
-        batch_size = sample_tensor.shape[0]
-        flats = []
-        for i in range(batch_size):
-            item = {k: v[i] for k, v in encoded_obs.items()}
-            flats.append(flatten_combat_obs(item))
-        return torch.stack(flats, dim=0)
+        out: Dict[str, torch.Tensor] = {}
+        for k, v in encoded_obs.items():
+            if k in {"hand_cards", "enemies", "potions"}:
+                if v.dim() == 2:
+                    out[k] = v.unsqueeze(0)
+                else:
+                    out[k] = v
+            elif k in {"hand_mask", "enemy_mask", "potion_mask"}:
+                if v.dim() == 1:
+                    out[k] = v.unsqueeze(0)
+                else:
+                    out[k] = v
+            elif k == "valid_action_mask":
+                if v.dim() == 1:
+                    out[k] = v.unsqueeze(0)
+                else:
+                    out[k] = v
+            else:
+                if v.dim() == 1:
+                    out[k] = v.unsqueeze(0)
+                else:
+                    out[k] = v
+        return out
 
     def _extract_action_mask(self, encoded_obs: Dict[str, torch.Tensor]) -> torch.Tensor:
         mask = encoded_obs["valid_action_mask"]
-
         if mask.dim() == 1:
             mask = mask.unsqueeze(0)
-
         return mask
 
     def _apply_action_mask(
@@ -285,7 +388,6 @@ class CombatModel(nn.Module):
         """
         masked_logits = logits.masked_fill(valid_action_mask <= 0.0, LOGIT_NEG)
 
-        # Failsafe: if a whole row is invalid, enable dynamic end-turn index
         invalid_rows = torch.all(valid_action_mask <= 0.0, dim=-1)
         if invalid_rows.any():
             masked_logits = masked_logits.clone()
@@ -308,7 +410,6 @@ class CombatModel(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
-        # Slightly smaller init for policy logits
         last_policy_linear = None
         for m in self.policy_head.modules():
             if isinstance(m, nn.Linear):
@@ -341,9 +442,6 @@ def compute_ppo_loss(
     value_coef: float,
     entropy_coef: float,
 ) -> Dict[str, torch.Tensor]:
-    """
-    Standard PPO clipped objective.
-    """
     eval_out = model.evaluate_actions(batch_obs, batch_actions)
     new_log_probs = eval_out["log_prob"]
     entropy = eval_out["entropy"]
@@ -383,32 +481,35 @@ def stack_encoded_obs(encoded_list: list[Dict[str, torch.Tensor]]) -> Dict[str, 
     Stack a list of encoded obs dicts into a batch dict.
     """
     if len(encoded_list) == 0:
-        raise ValueError("encoded_list is empty")
+        raise ValueError("encoded_list must not be empty")
 
     keys = encoded_list[0].keys()
-    batch = {}
+    out: Dict[str, torch.Tensor] = {}
+
     for key in keys:
-        batch[key] = torch.stack([item[key] for item in encoded_list], dim=0)
-    return batch
+        out[key] = torch.stack([item[key] for item in encoded_list], dim=0)
+
+    return out
 
 
 # =========================================================
-# Debug run
+# Debug
 # =========================================================
 
 if __name__ == "__main__":
     cfg = get_default_config()
-    model = CombatModel(cfg)
+    model = CombatModel(cfg, hidden_dim=256, slot_hidden_dim=128, dropout=0.0)
 
     sample_state = {
+        "turn": 2,
         "energy": 3,
         "player": {
-            "current_hp": 68,
+            "current_hp": 61,
             "max_hp": 80,
-            "block": 4,
+            "block": 2,
             "powers": [
-                {"id": "Strength", "amount": 2},
-                {"id": "Dexterity", "amount": 1},
+                {"id": "Strength", "amount": 1},
+                {"id": "Rage", "amount": 3},
             ],
             "relics": [{"name": "Burning Blood"}],
         },
@@ -421,10 +522,22 @@ if __name__ == "__main__":
         "draw_pile": [{"id": "Strike_R"}, {"id": "Defend_R"}],
         "discard_pile": [],
         "exhaust_pile": [],
+        "combat_meta": {
+            "cards_played_this_turn": 1,
+            "attacks_played_this_turn": 1,
+            "double_tap_charges": 0,
+            "cannot_draw_more_this_turn": False,
+            "last_x_energy_spent": 0,
+            "attack_counter": 1,
+            "next_attack_double": False,
+            "first_attack_done": True,
+            "is_elite": False,
+            "is_boss": False,
+        },
         "monsters": [
             {
                 "name": "Jaw Worm",
-                "current_hp": 38,
+                "current_hp": 12,
                 "max_hp": 42,
                 "block": 0,
                 "intent": "ATTACK",
@@ -438,18 +551,21 @@ if __name__ == "__main__":
                 "block": 0,
                 "intent": "BUFF",
                 "intent_base_damage": 0,
-                "powers": [],
+                "powers": [{"id": "Ritual", "amount": 3}],
             },
         ],
-        "potions": [],
+        "potions": [
+            {"name": "Fire Potion", "usable": True, "empty": False, "requires_target": True, "rarity": "Common"},
+            {"name": "Dexterity Potion", "usable": True, "empty": False, "requires_target": False, "rarity": "Uncommon"},
+        ],
     }
 
     encoded = model.encode_state(sample_state, device="cpu")
-    outputs = model.forward(encoded)
-    act_out = model.act(encoded, deterministic=False)
+    out = model.forward(encoded)
+    act = model.act(encoded, deterministic=False)
 
-    print("obs_dim:", model.obs_dim)
-    print("logits shape:", tuple(outputs["logits"].shape))
-    print("value shape:", tuple(outputs["value"].shape))
-    print("sampled action:", act_out["action"])
-    print("log_prob:", act_out["log_prob"])
+    print("logits shape:", tuple(out["logits"].shape))
+    print("value shape:", tuple(out["value"].shape))
+    print("probs shape:", tuple(out["probs"].shape))
+    print("sampled action:", int(act["action"].item()))
+    print("sampled value:", float(act["value"].item()))
