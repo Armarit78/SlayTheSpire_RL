@@ -416,7 +416,10 @@ class CombatEncoder:
 
             is_dead = bool(m.get("isDead", False)) or bool(m.get("dead", False))
             escaped = bool(m.get("escaped", False))
-            alive = 0 if is_dead or escaped or hp <= 0 else 1
+            is_gone = bool(m.get("is_gone", False))
+            half_dead = bool(m.get("half_dead", False))
+
+            alive = 0 if is_dead or escaped or is_gone or half_dead or hp <= 0 else 1
 
             name = str(m.get("name", "UnknownEnemy"))
 
