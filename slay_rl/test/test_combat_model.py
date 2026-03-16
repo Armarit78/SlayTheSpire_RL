@@ -228,3 +228,31 @@ def test_combat_model_act_from_state_runs(make_state):
 
     action = int(out["action"].item())
     assert 0 <= action < model.total_actions
+
+def test_combat_model_forward_with_attention_keeps_shapes(make_state):
+    model = CombatModel()
+    encoded = model.encode_state(_sample_state(make_state), device="cpu")
+
+    out = model.forward(encoded)
+
+    assert out["logits"].shape == (1, model.total_actions)
+    assert out["value"].shape == (1,)
+    assert out["probs"].shape == (1, model.total_actions)
+    assert torch.isfinite(out["logits"]).all()
+    assert torch.isfinite(out["value"]).all()
+    assert torch.isfinite(out["probs"]).all()
+
+
+def test_combat_model_attention_respects_masks(make_state):
+    model = CombatModel()
+    encoded = model.encode_state(_sample_state(make_state), device="cpu")
+
+    # force empty enemy slots except first one
+    encoded["enemy_mask"][1:] = 0.0
+    encoded["enemies"][1:] = 0.0
+
+    out = model.forward(encoded)
+    logits = out["logits"]
+
+    assert logits.shape == (1, model.total_actions)
+    assert torch.isfinite(logits).all()

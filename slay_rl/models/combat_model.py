@@ -47,9 +47,9 @@ class SlotEncoder(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, n, d = x.shape
-        x = x.view(b * n, d)
+        x = x.reshape(b * n, d)
         x = self.net(x)
-        x = x.view(b, n, -1)
+        x = x.reshape(b, n, -1)
         return x
 
 
@@ -103,6 +103,104 @@ class MaskedMaxPool(nn.Module):
         return pooled
 
 
+class SlotAttentionBlock(nn.Module):
+    """
+    Simple Transformer-style block for slot tokens with residuals.
+    Input:  [B, N, H]
+    Mask:   [B, N] with 1=valid, 0=invalid
+    Output: [B, N, H]
+    """
+    def __init__(self, hidden_dim: int, num_heads: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.ff = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 4, hidden_dim),
+            nn.Dropout(dropout),
+        )
+        self.norm2 = nn.LayerNorm(hidden_dim)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        # key_padding_mask: True means ignore
+        key_padding_mask = mask <= 0.0
+
+        attn_out, _ = self.attn(
+            query=x,
+            key=x,
+            value=x,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+        x = self.norm1(x + attn_out)
+
+        ff_out = self.ff(x)
+        x = self.norm2(x + ff_out)
+
+        # zero-out invalid slots after attention for safety
+        x = x * mask.unsqueeze(-1).float()
+        return x
+
+
+class CrossAttentionBlock(nn.Module):
+    """
+    Cross-attention where left slots attend to right slots.
+    left:  [B, N, H]
+    right: [B, M, H]
+    left_mask:  [B, N]
+    right_mask: [B, M]
+    out:   [B, N, H]
+    """
+    def __init__(self, hidden_dim: int, num_heads: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.ff = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 4, hidden_dim),
+            nn.Dropout(dropout),
+        )
+        self.norm2 = nn.LayerNorm(hidden_dim)
+
+    def forward(
+        self,
+        left: torch.Tensor,
+        right: torch.Tensor,
+        left_mask: torch.Tensor,
+        right_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        key_padding_mask = right_mask <= 0.0
+
+        attn_out, _ = self.attn(
+            query=left,
+            key=right,
+            value=right,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+        x = self.norm1(left + attn_out)
+
+        ff_out = self.ff(x)
+        x = self.norm2(x + ff_out)
+
+        x = x * left_mask.unsqueeze(-1).float()
+        return x
+
+
 # =========================================================
 # Structured combat model
 # =========================================================
@@ -135,14 +233,14 @@ class CombatModel(nn.Module):
         self.total_actions = self.cfg.combat_action.total_actions
 
         # dims from encoder/config
-        self.player_dim = self.cfg.combat_obs.player_scalar_dim
-        self.enemy_dim = self.cfg.combat_obs.enemy_scalar_dim
-        self.potion_dim = self.cfg.combat_obs.potion_scalar_dim
-        self.context_dim = self.cfg.combat_obs.combat_context_dim
+        self.player_dim: int = int(self.cfg.combat_obs.player_scalar_dim)
+        self.enemy_dim: int = int(self.cfg.combat_obs.enemy_scalar_dim)
+        self.potion_dim: int = int(self.cfg.combat_obs.potion_scalar_dim)
+        self.context_dim: int = int(self.cfg.combat_obs.combat_context_dim)
 
-        self.hand_dim = self.encoder.card_feature_dim
-        self.deck_dim = self.cfg.combat_obs.card_vocab_size
-        self.relic_dim = self.cfg.combat_obs.relic_vocab_size
+        self.hand_dim: int = int(self.encoder.card_feature_dim)
+        self.deck_dim: int = int(self.cfg.combat_obs.card_vocab_size)
+        self.relic_dim: int = int(self.cfg.combat_obs.relic_vocab_size)
 
         # scalar/global encoders
         self.player_encoder = ScalarEncoder(self.player_dim, hidden_dim, dropout=dropout)
@@ -158,6 +256,19 @@ class CombatModel(nn.Module):
         self.hand_encoder = SlotEncoder(self.hand_dim, slot_hidden_dim, dropout=dropout)
         self.enemy_encoder = SlotEncoder(self.enemy_dim, slot_hidden_dim, dropout=dropout)
         self.potion_encoder = SlotEncoder(self.potion_dim, slot_hidden_dim, dropout=dropout)
+
+        # positional embeddings
+        self.hand_pos_emb = nn.Embedding(self.cfg.combat_obs.max_hand_cards, slot_hidden_dim)
+        self.enemy_pos_emb = nn.Embedding(self.cfg.combat_obs.max_enemies, slot_hidden_dim)
+        self.potion_pos_emb = nn.Embedding(self.cfg.combat_obs.max_potions, slot_hidden_dim)
+
+        # lightweight attention over slots
+        self.hand_self_attn = SlotAttentionBlock(slot_hidden_dim, num_heads=4, dropout=dropout)
+        self.enemy_self_attn = SlotAttentionBlock(slot_hidden_dim, num_heads=4, dropout=dropout)
+        self.potion_self_attn = SlotAttentionBlock(slot_hidden_dim, num_heads=4, dropout=dropout)
+
+        # cards attend to enemies before factorized target scoring
+        self.hand_to_enemy_attn = CrossAttentionBlock(slot_hidden_dim, num_heads=4, dropout=dropout)
 
         # pooling
         self.mean_pool = MaskedMeanPool()
@@ -176,12 +287,65 @@ class CombatModel(nn.Module):
             MLPBlock(hidden_dim, hidden_dim, dropout=dropout),
         )
 
-        # heads
-        self.policy_head = nn.Sequential(
-            MLPBlock(hidden_dim, hidden_dim // 2, dropout=dropout),
-            nn.Linear(hidden_dim // 2, self.total_actions),
+        # =====================================================
+        # Factorized policy heads
+        # =====================================================
+        pair_in_dim = slot_hidden_dim * 2 + hidden_dim
+        slot_with_global_dim = slot_hidden_dim + hidden_dim
+
+        # play card: non-targeted [hand_slot]
+        self.play_card_head = nn.Sequential(
+            MLPBlock(slot_with_global_dim, hidden_dim // 2, dropout=dropout),
+            nn.Linear(hidden_dim // 2, 1),
         )
 
+        # play card: targeted [hand_slot, enemy_slot]
+        self.play_card_target_head = nn.Sequential(
+            MLPBlock(pair_in_dim, hidden_dim // 2, dropout=dropout),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+        # end turn [global]
+        self.end_turn_head = nn.Sequential(
+            MLPBlock(hidden_dim, hidden_dim // 2, dropout=dropout),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+        # potions: non-targeted [potion_slot]
+        self.use_potion_head = nn.Sequential(
+            MLPBlock(slot_with_global_dim, hidden_dim // 2, dropout=dropout),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+        # potions: targeted [potion_slot, enemy_slot]
+        self.use_potion_target_head = nn.Sequential(
+            MLPBlock(pair_in_dim, hidden_dim // 2, dropout=dropout),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+        # choice actions on hand slots
+        self.choose_hand_head = nn.Sequential(
+            MLPBlock(slot_with_global_dim, hidden_dim // 2, dropout=dropout),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+        self.choose_discard_head = nn.Sequential(
+            MLPBlock(slot_with_global_dim, hidden_dim // 2, dropout=dropout),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+        self.choose_exhaust_head = nn.Sequential(
+            MLPBlock(slot_with_global_dim, hidden_dim // 2, dropout=dropout),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+        # choose option [global] -> K scores
+        self.choose_option_head = nn.Sequential(
+            MLPBlock(hidden_dim, hidden_dim // 2, dropout=dropout),
+            nn.Linear(hidden_dim // 2, self.cfg.combat_action.max_choose_option_actions),
+        )
+
+        # value head stays global
         self.value_head = nn.Sequential(
             MLPBlock(hidden_dim, hidden_dim // 2, dropout=dropout),
             nn.Linear(hidden_dim // 2, 1),
@@ -229,6 +393,28 @@ class CombatModel(nn.Module):
         enemy_repr = self.enemy_encoder(obs["enemies"])
         potion_repr = self.potion_encoder(obs["potions"])
 
+        # add positional embeddings
+        hand_pos = torch.arange(hand_repr.size(1), device=hand_repr.device)
+        enemy_pos = torch.arange(enemy_repr.size(1), device=enemy_repr.device)
+        potion_pos = torch.arange(potion_repr.size(1), device=potion_repr.device)
+
+        hand_repr = hand_repr + self.hand_pos_emb(hand_pos)
+        enemy_repr = enemy_repr + self.enemy_pos_emb(enemy_pos)
+        potion_repr = potion_repr + self.potion_pos_emb(potion_pos)
+
+        # local structure before pooling / policy heads
+        hand_repr = self.hand_self_attn(hand_repr, obs["hand_mask"])
+        enemy_repr = self.enemy_self_attn(enemy_repr, obs["enemy_mask"])
+        potion_repr = self.potion_self_attn(potion_repr, obs["potion_mask"])
+
+        # let hand tokens condition on current enemies
+        hand_repr = self.hand_to_enemy_attn(
+            left=hand_repr,
+            right=enemy_repr,
+            left_mask=obs["hand_mask"],
+            right_mask=obs["enemy_mask"],
+        )
+
         hand_mean = self.mean_pool(hand_repr, obs["hand_mask"])
         hand_max = self.max_pool(hand_repr, obs["hand_mask"])
         hand_summary = self.hand_pool_proj(torch.cat([hand_mean, hand_max], dim=-1))
@@ -254,7 +440,14 @@ class CombatModel(nn.Module):
         )
 
         features = self.fusion(fused)
-        raw_logits = self.policy_head(features)
+
+        raw_logits = self._build_factorized_policy_logits(
+            global_features=features,
+            hand_repr=hand_repr,
+            enemy_repr=enemy_repr,
+            potion_repr=potion_repr,
+        )
+
         masked_logits = self._apply_action_mask(raw_logits, valid_action_mask)
 
         value = self.value_head(features).squeeze(-1)
@@ -344,6 +537,156 @@ class CombatModel(nn.Module):
     # Internal helpers
     # =========================================================
 
+    def _build_factorized_policy_logits(
+        self,
+        global_features: torch.Tensor,
+        hand_repr: torch.Tensor,
+        enemy_repr: torch.Tensor,
+        potion_repr: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Rebuild the flat action logits using structured heads.
+
+        global_features: [B, G]
+        hand_repr:       [B, H, Dh]
+        enemy_repr:      [B, E, De]
+        potion_repr:     [B, P, Dp]
+        """
+        bsz = global_features.size(0)
+
+        max_hand = self.cfg.combat_obs.max_hand_cards
+        max_enemies = self.cfg.combat_obs.max_enemies
+        max_potions = self.cfg.combat_obs.max_potions
+
+        max_choose_hand = self.cfg.combat_action.max_choose_hand_actions
+        max_choose_option = self.cfg.combat_action.max_choose_option_actions
+        max_choose_discard = self.cfg.combat_action.max_choose_discard_actions
+        max_choose_exhaust = self.cfg.combat_action.max_choose_exhaust_actions
+
+        device = global_features.device
+        raw_logits = torch.full(
+            (bsz, self.total_actions),
+            fill_value=0.0,
+            dtype=global_features.dtype,
+            device=device,
+        )
+
+        # -------------------------------------------------
+        # Layout boundaries (must match CombatAgent decode)
+        # -------------------------------------------------
+        targeted_base = max_hand
+        targeted_size = max_hand * max_enemies
+        end_turn_idx = targeted_base + targeted_size
+
+        potion_base = end_turn_idx + 1
+        potion_target_base = potion_base + max_potions
+        potion_target_size = max_potions * max_enemies
+
+        choose_hand_base = potion_target_base + potion_target_size
+        choose_option_base = choose_hand_base + max_choose_hand
+        choose_discard_base = choose_option_base + max_choose_option
+        choose_exhaust_base = choose_discard_base + max_choose_discard
+
+        # -------------------------------------------------
+        # Non-target card play logits: [B, H]
+        # -------------------------------------------------
+        hand_global = self._concat_slot_with_global(hand_repr, global_features)
+        play_card_logits = self.play_card_head(hand_global).squeeze(-1)
+        raw_logits[:, :max_hand] = play_card_logits
+
+        # -------------------------------------------------
+        # Targeted card play logits: [B, H, E]
+        # -------------------------------------------------
+        play_target_logits = self._pairwise_slot_logits(
+            left_slots=hand_repr,
+            right_slots=enemy_repr,
+            global_features=global_features,
+            head=self.play_card_target_head,
+        )
+        raw_logits[:, targeted_base:targeted_base + targeted_size] = play_target_logits.reshape(bsz, -1)
+
+        # -------------------------------------------------
+        # End turn: [B]
+        # -------------------------------------------------
+        raw_logits[:, end_turn_idx] = self.end_turn_head(global_features).squeeze(-1)
+
+        # -------------------------------------------------
+        # Non-target potion logits: [B, P]
+        # -------------------------------------------------
+        potion_global = self._concat_slot_with_global(potion_repr, global_features)
+        potion_logits = self.use_potion_head(potion_global).squeeze(-1)
+        raw_logits[:, potion_base:potion_base + max_potions] = potion_logits
+
+        # -------------------------------------------------
+        # Targeted potion logits: [B, P, E]
+        # -------------------------------------------------
+        potion_target_logits = self._pairwise_slot_logits(
+            left_slots=potion_repr,
+            right_slots=enemy_repr,
+            global_features=global_features,
+            head=self.use_potion_target_head,
+        )
+        raw_logits[:, potion_target_base:potion_target_base + potion_target_size] = potion_target_logits.reshape(bsz, -1)
+
+        # -------------------------------------------------
+        # Choice on hand slots
+        # -------------------------------------------------
+        choose_hand_logits = self.choose_hand_head(hand_global).squeeze(-1)
+        raw_logits[:, choose_hand_base:choose_hand_base + max_choose_hand] = choose_hand_logits[:, :max_choose_hand]
+
+        choose_discard_logits = self.choose_discard_head(hand_global).squeeze(-1)
+        raw_logits[:, choose_discard_base:choose_discard_base + max_choose_discard] = choose_discard_logits[:, :max_choose_discard]
+
+        choose_exhaust_logits = self.choose_exhaust_head(hand_global).squeeze(-1)
+        raw_logits[:, choose_exhaust_base:choose_exhaust_base + max_choose_exhaust] = choose_exhaust_logits[:, :max_choose_exhaust]
+
+        # -------------------------------------------------
+        # Choice options
+        # -------------------------------------------------
+        option_logits = self.choose_option_head(global_features)
+        raw_logits[:, choose_option_base:choose_option_base + max_choose_option] = option_logits[:, :max_choose_option]
+
+        return raw_logits
+
+    def _concat_slot_with_global(
+        self,
+        slots: torch.Tensor,
+        global_features: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        slots: [B, N, D]
+        global_features: [B, G]
+        out: [B, N, D + G]
+        """
+        bsz, n_slots, _ = slots.shape
+        global_expanded = global_features.unsqueeze(1).expand(bsz, n_slots, global_features.size(-1))
+        return torch.cat([slots, global_expanded], dim=-1)
+
+    def _pairwise_slot_logits(
+        self,
+        left_slots: torch.Tensor,
+        right_slots: torch.Tensor,
+        global_features: torch.Tensor,
+        head: nn.Module,
+    ) -> torch.Tensor:
+        """
+        left_slots: [B, N, Dl]
+        right_slots: [B, M, Dr]
+        global_features: [B, G]
+        out: [B, N, M]
+        """
+        bsz, n_left, d_left = left_slots.shape
+        _, n_right, d_right = right_slots.shape
+        gdim = global_features.size(-1)
+
+        left_expanded = left_slots.unsqueeze(2).expand(bsz, n_left, n_right, d_left)
+        right_expanded = right_slots.unsqueeze(1).expand(bsz, n_left, n_right, d_right)
+        global_expanded = global_features.unsqueeze(1).unsqueeze(2).expand(bsz, n_left, n_right, gdim)
+
+        pair_features = torch.cat([left_expanded, right_expanded, global_expanded], dim=-1)
+        pair_logits = head(pair_features.reshape(bsz * n_left * n_right, -1))
+        return pair_logits.view(bsz, n_left, n_right)
+
     def _ensure_batched(self, encoded_obs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
         Convert encoded dict to batched tensors.
@@ -410,13 +753,26 @@ class CombatModel(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
-        last_policy_linear = None
-        for m in self.policy_head.modules():
-            if isinstance(m, nn.Linear):
-                last_policy_linear = m
-        if last_policy_linear is not None:
-            nn.init.orthogonal_(last_policy_linear.weight, gain=0.01)
-            nn.init.zeros_(last_policy_linear.bias)
+        policy_heads = [
+            self.play_card_head,
+            self.play_card_target_head,
+            self.end_turn_head,
+            self.use_potion_head,
+            self.use_potion_target_head,
+            self.choose_hand_head,
+            self.choose_option_head,
+            self.choose_discard_head,
+            self.choose_exhaust_head,
+        ]
+
+        for head in policy_heads:
+            last_linear = None
+            for m in head.modules():
+                if isinstance(m, nn.Linear):
+                    last_linear = m
+            if last_linear is not None:
+                nn.init.orthogonal_(last_linear.weight, gain=0.01)
+                nn.init.zeros_(last_linear.bias)
 
         last_value_linear = None
         for m in self.value_head.modules():
