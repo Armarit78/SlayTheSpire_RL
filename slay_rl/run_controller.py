@@ -110,8 +110,12 @@ class RunController:
         for step_idx in range(max_steps):
             decision = self.agent.choose_action(state, deterministic=deterministic)
             action_index = int(decision["action_index"])
+            command = decision["command"]
 
-            next_state, reward, done, info = self.env.step(action_index)
+            next_state, reward, done, info = self.env.step_command(
+                command,
+                forced_action_index=action_index,
+            )
 
             total_reward += reward
             history.append(

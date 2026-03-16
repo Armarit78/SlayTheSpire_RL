@@ -177,6 +177,34 @@ class DummyVecCombatEnv:
 
         return next_states, rewards, dones, infos
 
+    def step_commands(self, commands, action_indices=None):
+        next_states = []
+        rewards = []
+        dones = []
+        infos = []
+
+        for i, (env, command) in enumerate(zip(self.envs, commands)):
+            forced_idx = None
+            if action_indices is not None:
+                forced_idx = int(action_indices[i])
+
+            next_state, reward, done, info = env.step_command(
+                command,
+                forced_action_index=forced_idx,
+            )
+
+            if done:
+                info = dict(info)
+                info["terminal_state"] = next_state
+                next_state = env.reset()
+
+            next_states.append(next_state)
+            rewards.append(reward)
+            dones.append(done)
+            infos.append(info)
+
+        return next_states, rewards, dones, infos
+
 
 # =========================================================
 # Trainer
@@ -219,18 +247,20 @@ class CombatTrainer:
             seed=seed,
         )
 
+        self.current_states = self.vec_env.reset()
+
         self.model = CombatModel(cfg=self.cfg).to(self.device)
         self.agent = CombatAgent(self.model, cfg=self.cfg, device=self.device)
 
         self.optimizer = Adam(self.model.parameters(), lr=self.cfg.ppo.lr)
 
-        self.checkpoint_dir = Path(CHECKPOINT_DIR) / cfg.train.run_name
-        self.log_dir = Path(LOG_DIR) / cfg.train.run_name
+        self.checkpoint_dir = Path(CHECKPOINT_DIR) / self.cfg.train.run_name
+        self.log_dir = Path(LOG_DIR) / self.cfg.train.run_name
 
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
-        print(f"Run name: {cfg.train.run_name}")
+        print(f"Run name: {self.cfg.train.run_name}")
         print(f"Checkpoint dir: {self.checkpoint_dir}")
         print(f"Log dir: {self.log_dir}")
 
@@ -306,7 +336,7 @@ class CombatTrainer:
         episode_wins: List[int] = []
 
         self.vec_env.set_training_progress(update_idx)
-        states = self.vec_env.reset()
+        states = self.current_states
 
         current_ep_rewards = [0.0 for _ in range(self.num_envs)]
         current_ep_lengths = [0 for _ in range(self.num_envs)]
@@ -328,7 +358,15 @@ class CombatTrainer:
                 if self._is_potion_action(action):
                     potion_actions += 1
 
-            next_states, rewards, dones, infos = self.vec_env.step(actions)
+            commands = [
+                self.agent.decode_action_index(action, state)
+                for action, state in zip(actions, states)
+            ]
+
+            next_states, rewards, dones, infos = self.vec_env.step_commands(
+                commands,
+                actions,
+            )
 
             for env_idx in range(self.num_envs):
                 buffers[env_idx].add(
@@ -389,6 +427,8 @@ class CombatTrainer:
         adv_mean = batch["advantages"].mean()
         adv_std = batch["advantages"].std(unbiased=False)
         batch["advantages"] = (batch["advantages"] - adv_mean) / (adv_std + 1e-8)
+
+        self.current_states = states
 
         return {
             "batch": batch,
@@ -489,7 +529,7 @@ class CombatTrainer:
         wins = []
         win_lengths = []
         final_hp_ratios = []
-        damage_taken_values = []
+        episode_damage_taken_values = []
         potion_actions = 0
         truncations = 0
 
@@ -502,6 +542,7 @@ class CombatTrainer:
             done = False
             ep_reward = 0.0
             ep_len = 0
+            ep_damage_taken = 0.0
             last_info = {}
 
             while not done and ep_len < 500:
@@ -512,13 +553,18 @@ class CombatTrainer:
                 if self._is_potion_action(action_index):
                     potion_actions += 1
 
-                next_state, reward, done, info = eval_env.step(action_index)
+                command = self.agent.decode_action_index(action_index, state)
+
+                next_state, reward, done, info = eval_env.step_command(
+                    command,
+                    forced_action_index=action_index,
+                )
 
                 reward_breakdown = info.get("reward_breakdown", {})
                 player_hp_before = float(reward_breakdown.get("player_hp_before", 0.0))
                 player_hp_after = float(reward_breakdown.get("player_hp_after", player_hp_before))
                 step_damage_taken = max(0.0, player_hp_before - player_hp_after)
-                damage_taken_values.append(step_damage_taken)
+                ep_damage_taken += step_damage_taken
 
                 ep_reward += reward
                 ep_len += 1
@@ -530,6 +576,7 @@ class CombatTrainer:
 
             rewards.append(ep_reward)
             lengths.append(ep_len)
+            episode_damage_taken_values.append(ep_damage_taken)
 
             combat_won = bool(last_info.get("combat_won", False))
             wins.append(1 if combat_won else 0)
@@ -547,7 +594,7 @@ class CombatTrainer:
         win_rate = sum(wins) / max(len(wins), 1)
 
         avg_final_hp_ratio = sum(final_hp_ratios) / max(len(final_hp_ratios), 1)
-        avg_damage_taken = sum(damage_taken_values) / max(len(rewards), 1)
+        avg_damage_taken = sum(episode_damage_taken_values) / max(len(episode_damage_taken_values), 1)
         avg_win_len = sum(win_lengths) / max(len(win_lengths), 1)
 
         return {

@@ -3391,9 +3391,14 @@ class STSEnv:
             raise RuntimeError("Environment not reset. Call reset() first.")
         return copy.deepcopy(self.state)
 
-    def step(self, action_index: int) -> Tuple[Dict[str, Any], float, bool, Dict[str, Any]]:
+    def step(self, action: int | CombatCommand) -> Tuple[Dict[str, Any], float, bool, Dict[str, Any]]:
         if self.state is None:
             raise RuntimeError("Environment not reset. Call reset() first.")
+
+        if isinstance(action, CombatCommand):
+            return self.step_command(action)
+
+        action_index = int(action)
         command = self.decode_action_index(action_index, self.state)
         return self.step_command(command, forced_action_index=action_index)
 
