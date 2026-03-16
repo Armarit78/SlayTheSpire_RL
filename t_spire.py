@@ -24,8 +24,8 @@ CHECKPOINT_PATH = (
     PROJECT_ROOT
     / "slay_rl"
     / "checkpoints"
-    / "experiment_2_vec_bigrollout"
-    / "combat_model_update_1100.pt"
+    / "experiment_4"
+    / "combat_model_best_robust.pt"
 )
 
 DETERMINISTIC = True
@@ -40,6 +40,11 @@ DISABLE_POTIONS = False
 # Si ta version de CommunicationMod attend un slot 1-based au lieu de 0-based,
 # change juste cette valeur à 1.
 POTION_SLOT_OFFSET = 0
+
+# Même logique pour les cibles ennemies. Par défaut on suppose 0-based.
+# Si tu observes qu'un PLAY 1 0 touche le "mauvais" ennemi et qu'il faut 1-based,
+# passe cette valeur à 1.
+TARGET_INDEX_OFFSET = 0
 
 # Temps d'attente hors combat pour ne pas spammer STATE
 OUTSIDE_COMBAT_WAIT_FRAMES = 30
@@ -92,6 +97,60 @@ def _normalize_relics(raw_relics: Any) -> List[Dict[str, Any]]:
     return out
 
 
+
+
+def _infer_card_has_target(card: Dict[str, Any]) -> bool:
+    if "has_target" in card:
+        return bool(card.get("has_target"))
+
+    if "target" in card:
+        target = str(card.get("target", "")).upper()
+        if target in {"ENEMY", "SINGLE", "MONSTER"}:
+            return True
+        if target in {"ALL", "SELF", "NONE"}:
+            return False
+
+    if card.get("targeted", False):
+        return True
+    if card.get("aoe_damage") is not None:
+        return False
+    if card.get("apply_weak_all") is not None:
+        return False
+    if card.get("apply_vulnerable_all") is not None:
+        return False
+    if card.get("x_aoe_damage") is not None:
+        return False
+
+    card_id = str(card.get("id", card.get("card_id", card.get("name", ""))))
+    normalized = card_id.strip().replace("_", " ").lower()
+
+    known_target_cards = {
+        "strike r", "bash", "body slam", "clash", "clothesline", "headbutt",
+        "heavy blade", "iron wave", "perfected strike", "pommel strike", "twin strike",
+        "wild strike", "blood for blood", "carnage", "disarm", "dropkick",
+        "hemokinesis", "pummel", "rampage", "reckless charge", "searing blow",
+        "sever soul", "spot weakness", "uppercut", "bludgeon", "feed", "fiend fire",
+    }
+    known_no_target_cards = {
+        "defend r", "anger", "armaments", "cleave", "flex", "havoc", "shrug it off",
+        "sword boomerang", "thunderclap", "true grit", "warcry", "battle trance",
+        "bloodletting", "burning pact", "combust", "dark embrace", "dual wield",
+        "entrench", "evolve", "feel no pain", "fire breathing", "flame barrier",
+        "ghostly armor", "infernal blade", "inflame", "intimidate", "metallicize",
+        "power through", "rage", "rupture", "second wind", "seeing red", "shockwave",
+        "whirlwind", "barricade", "berserk", "brutality", "corruption", "demon form",
+        "double tap", "exhume", "immolate", "impervious", "juggernaut", "limit break",
+        "offering", "reaper",
+    }
+
+    if normalized in known_target_cards:
+        return True
+    if normalized in known_no_target_cards:
+        return False
+
+    return str(card.get("type", "")).upper() == "ATTACK"
+
+
 def _normalize_cards(raw_cards: Any) -> List[Dict[str, Any]]:
     if not isinstance(raw_cards, list):
         return []
@@ -109,7 +168,7 @@ def _normalize_cards(raw_cards: Any) -> List[Dict[str, Any]]:
             "exhaust": bool(c.get("exhaust", c.get("exhausts", False))),
             "ethereal": bool(c.get("ethereal", c.get("isEthereal", False))),
             "is_playable": bool(c.get("is_playable", c.get("isPlayable", c.get("playable", False)))),
-            "has_target": bool(c.get("has_target", False)),
+            "has_target": _infer_card_has_target(c),
             "uuid": c.get("uuid"),
         })
     return out
@@ -179,6 +238,11 @@ def communicationmod_to_internal_state(payload: Dict[str, Any]) -> Dict[str, Any
         "relics": _normalize_relics(game_state.get("relics", [])),
     }
 
+    pending_choice = None
+    if is_combat_choice_screen(payload):
+        raw_choices = _extract_choice_list(payload)
+        pending_choice = _infer_pending_choice(payload, raw_choices)
+
     return {
         "turn": combat_state.get("turn", 1),
         "energy": player.get("energy", 0),
@@ -195,6 +259,7 @@ def communicationmod_to_internal_state(payload: Dict[str, Any]) -> Dict[str, Any
         "floor": game_state.get("floor"),
         "act": game_state.get("act"),
         "gold": game_state.get("gold"),
+        "pending_choice": pending_choice,
     }
 
 
@@ -432,6 +497,121 @@ def planner_choose_command(state: Dict[str, Any]) -> Optional[CombatCommand]:
 # COMMAND CONVERSION
 # =========================================================
 
+
+
+def _extract_choice_list(payload: Dict[str, Any]) -> List[Any]:
+    game_state = payload.get("game_state", {}) or {}
+    for key in ("choice_list", "choiceList", "choices", "cards", "options"):
+        value = game_state.get(key)
+        if isinstance(value, list):
+            return value
+    combat_state = game_state.get("combat_state", {}) or {}
+    for key in ("choice_list", "choiceList", "choices", "cards", "options"):
+        value = combat_state.get(key)
+        if isinstance(value, list):
+            return value
+    return []
+
+def _infer_pending_choice(payload: Dict[str, Any], raw_choices: List[Any]) -> Optional[Dict[str, Any]]:
+    game_state = payload.get("game_state", {}) or {}
+    combat_state = game_state.get("combat_state", {}) or {}
+
+    hand = _normalize_cards(combat_state.get("hand", []))
+    hand_names = [str(c.get("id", c.get("name", ""))) for c in hand]
+
+    raw_choice_names = []
+    for x in raw_choices:
+        if isinstance(x, dict):
+            raw_choice_names.append(str(x.get("id", x.get("name", ""))))
+        else:
+            raw_choice_names.append(str(x))
+
+    # Si les choix ressemblent à des cartes de la main, on essaye de spécialiser
+    if raw_choice_names and hand_names:
+        if all(name in hand_names for name in raw_choice_names):
+            lowered = " ".join(
+                str(v).lower()
+                for v in [
+                    game_state.get("screen_type", ""),
+                    game_state.get("choice_type", ""),
+                    game_state.get("choice_prompt", ""),
+                    combat_state.get("choice_type", ""),
+                    combat_state.get("choice_prompt", ""),
+                ]
+            )
+
+            valid_hand_indices = []
+            for choice_name in raw_choice_names:
+                for i, hand_name in enumerate(hand_names):
+                    if hand_name == choice_name and i not in valid_hand_indices:
+                        valid_hand_indices.append(i)
+                        break
+
+            if "discard" in lowered:
+                return {
+                    "choice_type": "choose_discard_target",
+                    "valid_hand_indices": valid_hand_indices,
+                }
+
+            if "exhaust" in lowered:
+                return {
+                    "choice_type": "choose_exhaust_target",
+                    "valid_hand_indices": valid_hand_indices,
+                }
+
+            return {
+                "choice_type": "choose_hand_card",
+                "valid_hand_indices": valid_hand_indices,
+            }
+
+    # Fallback : vrai écran d'options
+    return {
+        "choice_type": "choose_option",
+        "options": raw_choices[:5],
+    }
+
+def _choice_item_name(item: Any) -> str:
+    if isinstance(item, dict):
+        return str(item.get("name", item.get("id", item.get("card_id", item.get("label", "")))) or "")
+    return str(item or "")
+
+
+def choose_choice_index(payload: Dict[str, Any]) -> int:
+    choices = _extract_choice_list(payload)
+    if not choices:
+        return 0
+
+    # Rejet simple des options manifestement mauvaises.
+    bad_tokens = {"wound", "dazed", "burn", "slimed", "void", "curse", "regret", "pain", "normality"}
+    preferred_tokens = {
+        "inflame", "limit break", "demon form", "heavy blade", "spot weakness",
+        "shrug it off", "impervious", "flame barrier", "offering", "uppercut",
+        "pommel strike", "battle trance", "feel no pain", "dark embrace",
+    }
+
+    best_idx = 0
+    best_score = None
+    for idx, item in enumerate(choices):
+        name = _choice_item_name(item).strip().lower().replace("_", " ")
+        score = 0.0
+        if name:
+            if any(tok in name for tok in bad_tokens):
+                score -= 100.0
+            if any(tok in name for tok in preferred_tokens):
+                score += 10.0
+            if "+" in name:
+                score += 1.5
+            if "strike" in name:
+                score -= 0.5
+            if "defend" in name:
+                score -= 0.5
+        if best_score is None or score > best_score:
+            best_score = score
+            best_idx = idx
+
+    return int(best_idx)
+
+
 def internal_command_to_text(command: Any) -> str:
     if command is None:
         return "END"
@@ -450,7 +630,9 @@ def internal_command_to_text(command: Any) -> str:
         if target_index is None:
             return f"PLAY {card_index_1_based}"
 
-        return f"PLAY {card_index_1_based} {int(target_index)}"
+        target_text_index = int(target_index) + TARGET_INDEX_OFFSET
+        log(f"[bridge] target conversion hand={hand_index} target_internal={target_index} target_text={target_text_index}")
+        return f"PLAY {card_index_1_based} {target_text_index}"
 
     if command_type == "end_turn":
         return "END"
@@ -468,6 +650,18 @@ def internal_command_to_text(command: Any) -> str:
             return f"POTION Use {slot}"
 
         return f"POTION Use {slot} {int(target_index)}"
+
+    if command_type == "choose_option":
+        idx = getattr(command, "target_index", None)
+        if idx is None:
+            return "CHOOSE 0"
+        return f"CHOOSE {int(idx)}"
+
+    if command_type in {"choose_hand_card", "choose_discard_target", "choose_exhaust_target"}:
+        idx = getattr(command, "hand_index", None)
+        if idx is None:
+            return "CHOOSE 0"
+        return f"CHOOSE {int(idx)}"
 
     return "END"
 
@@ -493,6 +687,7 @@ class LiveModelBridge:
             self.model.eval()
             self.loaded_model = True
             log(f"[bridge] loaded checkpoint: {CHECKPOINT_PATH}")
+            log(f"[bridge] target_index_offset={TARGET_INDEX_OFFSET} potion_slot_offset={POTION_SLOT_OFFSET}")
         except Exception as exc:
             log(f"[bridge] failed to load checkpoint: {CHECKPOINT_PATH}")
             log(f"[bridge] load error: {exc}")
@@ -507,6 +702,21 @@ class LiveModelBridge:
             return "END"
 
         state = communicationmod_to_internal_state(payload)
+
+        pending_choice = state.get("pending_choice")
+        if isinstance(pending_choice, dict):
+            try:
+                if self.loaded_model:
+                    command = self.agent.choose_command(state, deterministic=DETERMINISTIC)
+                    text_cmd = internal_command_to_text(command)
+                    log(f"[model-choice] {command.to_dict()} -> {text_cmd}")
+                    return text_cmd
+            except Exception as exc:
+                log(f"[bridge] model choice decision error: {exc}")
+
+            choice_idx = choose_choice_index(payload)
+            log(f"[bridge] fallback choice heuristic -> CHOOSE {choice_idx}")
+            return f"CHOOSE {choice_idx}"
 
         # 1) planner tactique
         planned = planner_choose_command(state)
@@ -589,7 +799,9 @@ def main() -> None:
 
         # Ecran spécial pendant le combat = éviter le blocage
         if is_combat_choice_screen(payload):
-            print("CHOOSE 0")
+            choice_idx = choose_choice_index(payload)
+            log(f"[bridge] choice screen -> CHOOSE {choice_idx}")
+            print(f"CHOOSE {choice_idx}")
             sys.stdout.flush()
             continue
 

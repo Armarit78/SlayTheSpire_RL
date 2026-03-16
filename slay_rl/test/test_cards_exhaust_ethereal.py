@@ -31,9 +31,8 @@ def test_burning_pact_exhausts_bad_card_and_draws_two(make_state, step_helpers):
 
     assert illegal is False
     assert next_state["energy"] == 2
-    assert [c["id"] for c in next_state["exhaust_pile"]] == ["Wound"]
-    assert [c["id"] for c in next_state["discard_pile"]] == ["Burning Pact"]
-    assert [c["id"] for c in next_state["hand"]] == ["Strike_R", "Defend_R", "Bash"]
+    assert next_state["pending_choice"]["choice_type"] == "choose_exhaust_target"
+    assert next_state["pending_choice"]["valid_hand_indices"] == [1, 2]
 
 
 
@@ -53,10 +52,10 @@ def test_second_wind_exhausts_all_non_attacks_and_converts_them_to_block(make_st
     next_state, illegal = step_helpers.play_card(hand_index=0)
 
     assert illegal is False
-    assert next_state["player"]["block"] == 20
+    assert next_state["player"]["block"] == 15
     assert sorted(c["id"] for c in next_state["exhaust_pile"]) == ["Defend_R", "Ghostly Armor", "Second Wind", "Wound"]
-    assert [c["id"] for c in next_state["discard_pile"]] == ["Strike_R"]
-    assert next_state["hand"] == []
+    assert [c["id"] for c in next_state["discard_pile"]] == []
+    assert [c["id"] for c in next_state["hand"]] == ["Strike_R"]
 
 
 

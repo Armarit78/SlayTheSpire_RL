@@ -60,7 +60,11 @@ def test_true_grit_plus_exhausts_non_self_other_card(make_state, step_helpers):
 
     assert illegal is False
     assert next_state["player"]["block"] == 9
-    assert len(next_state["exhaust_pile"]) == 1
+
+    assert next_state["pending_choice"]["choice_type"] == "choose_exhaust_target"
+    assert next_state["pending_choice"]["valid_hand_indices"] == [1, 2]
+
+    assert next_state["exhaust_pile"] == []
 
 
 def test_offering_plus_draws_five_cards(make_state, step_helpers):

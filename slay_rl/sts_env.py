@@ -69,7 +69,7 @@ CARD_DEFS: Dict[str, Dict[str, Any]] = {
     "Battle Trance": {"type": "SKILL", "cost": 0, "draw": 3, "cannot_draw_more_this_turn": True},
     "Blood for Blood": {"type": "ATTACK", "cost": 4, "damage": 18, "targeted": True},
     "Bloodletting": {"type": "SKILL", "cost": 0, "lose_hp": 3, "gain_energy": 2},
-    "Burning Pact": {"type": "SKILL", "cost": 1, "exhaust_random_other": True, "draw": 2},
+    "Burning Pact": {"type": "SKILL","cost": 1,"exhaust_choose_other": True,"draw": 2,},
     "Carnage": {"type": "ATTACK", "cost": 2, "damage": 20, "targeted": True, "ethereal": True},
     "Combust": {"type": "POWER", "cost": 1, "power": ("Combust", 5), "combust_self_loss": 1},
     "Dark Embrace": {"type": "POWER", "cost": 2, "power": ("Dark Embrace", 1)},
@@ -94,7 +94,7 @@ CARD_DEFS: Dict[str, Dict[str, Any]] = {
     "Reckless Charge": {"type": "ATTACK", "cost": 0, "damage": 7, "targeted": True, "shuffle_status_draw": "Dazed"},
     "Rupture": {"type": "POWER", "cost": 1, "power": ("Rupture", 1)},
     "Searing Blow": {"type": "ATTACK", "cost": 2, "damage": 12, "targeted": True, "multi_upgrade_scaling": True},
-    "Second Wind": {"type": "SKILL", "cost": 1, "exhaust_all_non_attacks_for_block": 5},
+    "Second Wind": {"type": "SKILL","cost": 1,"exhaust_all_non_attacks_for_block": 5,"exhaust_self": True,},
     "Seeing Red": {"type": "SKILL", "cost": 1, "gain_energy": 2, "exhaust_self": True},
     "Sentinel": {"type": "SKILL", "cost": 1, "block": 5, "on_exhaust_gain_energy": 2},
     "Sever Soul": {"type": "ATTACK", "cost": 2, "damage": 16, "targeted": True, "exhaust_all_non_attacks": True},
@@ -1708,19 +1708,30 @@ class MockGameBackend:
 
         if command.command_type == "play_card":
             state, illegal_action = self._apply_play_card(state, command)
+
         elif command.command_type == "end_turn":
             state = self._apply_end_turn(state)
+
         elif command.command_type == "use_potion":
             potion_index = command.potion_index
-
             success = self._apply_use_potion(
                 state,
                 potion_index=potion_index if potion_index is not None else -1,
                 target_index=command.target_index,
             )
-
             if not success:
                 illegal_action = True
+
+        elif command.command_type in {
+            "choose_hand_card",
+            "choose_option",
+            "choose_discard_target",
+            "choose_exhaust_target",
+        }:
+            success = self._apply_pending_choice(state, command)
+            if not success:
+                illegal_action = True
+
         else:
             illegal_action = True
 
@@ -1734,6 +1745,85 @@ class MockGameBackend:
 
         self.state = state
         return copy.deepcopy(self.state), illegal_action
+
+    def _set_pending_choice(
+        self,
+        state: Dict[str, Any],
+        choice_type: str,
+        valid_hand_indices: Optional[List[int]] = None,
+        options: Optional[List[Any]] = None,
+        source_card_id: Optional[str] = None,
+    ) -> None:
+        state["pending_choice"] = {
+            "choice_type": choice_type,
+            "valid_hand_indices": list(valid_hand_indices or []),
+            "options": list(options or []),
+            "source_card_id": source_card_id,
+        }
+
+    def _clear_pending_choice(self, state: Dict[str, Any]) -> None:
+        state.pop("pending_choice", None)
+
+    def _apply_pending_choice(self, state: Dict[str, Any], command: CombatCommand) -> bool:
+        choice = state.get("pending_choice")
+        if not isinstance(choice, dict):
+            return False
+
+        choice_type = str(choice.get("choice_type", "")).strip().lower()
+        valid_hand_indices = choice.get("valid_hand_indices", []) or []
+        options = choice.get("options", []) or []
+        source_card_id = choice.get("source_card_id")
+
+        if choice_type == "choose_option":
+            idx = command.target_index
+            if idx is None or not (0 <= idx < len(options)):
+                return False
+
+            chosen = options[idx]
+            if isinstance(chosen, dict):
+                chosen_card = copy.deepcopy(chosen)
+            else:
+                chosen_card = make_card(str(chosen))
+
+            state["hand"].append(chosen_card)
+            self._clear_pending_choice(state)
+            return True
+
+        if choice_type == "choose_hand_card":
+            idx = command.hand_index
+            if idx is None or idx not in valid_hand_indices or not (0 <= idx < len(state["hand"])):
+                return False
+
+            card = state["hand"].pop(idx)
+            state["draw_pile"].insert(0, card)
+            self._clear_pending_choice(state)
+            return True
+
+        if choice_type == "choose_discard_target":
+            idx = command.hand_index
+            if idx is None or idx not in valid_hand_indices or not (0 <= idx < len(state["hand"])):
+                return False
+
+            card = state["hand"].pop(idx)
+            state["discard_pile"].append(card)
+            self._clear_pending_choice(state)
+            return True
+
+        if choice_type == "choose_exhaust_target":
+            idx = command.hand_index
+            if idx is None or idx not in valid_hand_indices or not (0 <= idx < len(state["hand"])):
+                return False
+
+            card = state["hand"].pop(idx)
+            self._exhaust_card_object(state, card)
+
+            if source_card_id == "Burning Pact":
+                self._draw_cards(state, 2)
+
+            self._clear_pending_choice(state)
+            return True
+
+        return False
 
     def _get_effective_card_def(self, card: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         card_id = card.get("id")
@@ -1870,7 +1960,7 @@ class MockGameBackend:
         if card_def.get("block"):
             self._gain_block(state, int(card_def["block"]))
 
-        if card_def.get("draw"):
+        if card_def.get("draw") and card["id"] != "Burning Pact":
             self._draw_cards(state, int(card_def["draw"]))
 
         if card_def.get("cannot_draw_more_this_turn"):
@@ -1887,7 +1977,14 @@ class MockGameBackend:
                 c["upgraded"] = True
 
         if card_def.get("put_one_hand_top_draw"):
-            self._put_random_hand_card_on_top_of_draw(state, exclude_card_id=card["id"])
+            valid = [i for i, c in enumerate(state["hand"]) if c["id"] != card["id"]]
+            if valid:
+                self._set_pending_choice(
+                    state,
+                    choice_type="choose_hand_card",
+                    valid_hand_indices=valid,
+                    source_card_id=card["id"],
+                )
 
         if card_def.get("move_discard_to_top"):
             self._move_random_discard_to_top_draw(state)
@@ -1896,7 +1993,18 @@ class MockGameBackend:
             self._play_top_draw_and_exhaust(state)
 
         if card_def.get("copy_attack_or_power"):
-            self._copy_attack_or_power_from_hand(state, int(card_def["copy_attack_or_power"]))
+            options = []
+            for c in state["hand"]:
+                cdef = CARD_DEFS.get(c["id"], {})
+                if cdef.get("type") in {"ATTACK", "POWER"}:
+                    options.append(copy.deepcopy(c))
+            if options:
+                self._set_pending_choice(
+                    state,
+                    choice_type="choose_option",
+                    options=options[: self.cfg.combat_action.max_choose_option_actions],
+                    source_card_id=card["id"],
+                )
 
         if card_def.get("move_exhaust_to_hand"):
             self._move_random_exhaust_to_hand(state)
@@ -1923,17 +2031,40 @@ class MockGameBackend:
             self.rng.shuffle(state["draw_pile"])
 
         if card_def.get("exhaust_choose_other"):
-            self._exhaust_random_other_card_from_hand(state, card["id"])
-        elif card_def.get("exhaust_random_other"):
-            self._exhaust_random_other_card_from_hand(state, card["id"])
+            valid = [i for i, c in enumerate(state["hand"]) if c["id"] != card["id"]]
+            if valid:
+                self._set_pending_choice(
+                    state,
+                    choice_type="choose_exhaust_target",
+                    valid_hand_indices=valid,
+                    source_card_id=card["id"],
+                )
 
-        if card_def.get("exhaust_all_non_attacks"):
-            self._exhaust_all_non_attacks_from_hand(state)
+        elif card_def.get("exhaust_random_other"):
+            self._exhaust_random_other_card_from_hand(
+                state,
+                exclude_card_id=card["id"],
+            )
 
         if card_def.get("exhaust_all_non_attacks_for_block"):
-            n = self._exhaust_all_non_attacks_from_hand(state)
-            per = int(card_def["exhaust_all_non_attacks_for_block"])
-            self._gain_block(state, per * n)
+            per_card_block = int(card_def["exhaust_all_non_attacks_for_block"])
+
+            to_exhaust = []
+            for i, c in enumerate(state["hand"]):
+                if c["id"] == card["id"]:
+                    continue
+                cdef = CARD_DEFS.get(c["id"], {})
+                if cdef.get("type") != "ATTACK":
+                    to_exhaust.append(i)
+
+            exhausted_count = 0
+            for i in reversed(to_exhaust):
+                card_obj = state["hand"].pop(i)
+                self._exhaust_card_object(state, card_obj)
+                exhausted_count += 1
+
+            if exhausted_count > 0:
+                self._gain_block(state, exhausted_count * per_card_block)
 
         damage_done = 0
 
@@ -2757,12 +2888,6 @@ class MockGameBackend:
                 return False
         return True
 
-    def _first_alive_monster_index(self, state: Dict[str, Any]) -> Optional[int]:
-        for i, m in enumerate(state["monsters"]):
-            if not self._monster_dead(m):
-                return i
-        return None
-
     def _choose_random_alive_monster(self, state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         alive = [m for m in state["monsters"] if not self._monster_dead(m)]
         return self.rng.choice(alive) if alive else None
@@ -3344,6 +3469,16 @@ class STSEnv:
         potion_target_base = potion_base + max_potions
         potion_target_size = max_potions * max_enemies
 
+        max_choose_hand = self.cfg.combat_action.max_choose_hand_actions
+        max_choose_option = self.cfg.combat_action.max_choose_option_actions
+        max_choose_discard = self.cfg.combat_action.max_choose_discard_actions
+        max_choose_exhaust = self.cfg.combat_action.max_choose_exhaust_actions
+
+        choose_hand_base = potion_target_base + potion_target_size
+        choose_option_base = choose_hand_base + max_choose_hand
+        choose_discard_base = choose_option_base + max_choose_option
+        choose_exhaust_base = choose_discard_base + max_choose_discard
+
         if 0 <= action_index < max_hand_cards:
             return CombatCommand(command_type="play_card", hand_index=action_index, target_index=None)
 
@@ -3373,6 +3508,30 @@ class STSEnv:
                 target_index=target_index,
             )
 
+        if choose_hand_base <= action_index < choose_option_base:
+            return CombatCommand(
+                command_type="choose_hand_card",
+                hand_index=action_index - choose_hand_base,
+            )
+
+        if choose_option_base <= action_index < choose_discard_base:
+            return CombatCommand(
+                command_type="choose_option",
+                target_index=action_index - choose_option_base,
+            )
+
+        if choose_discard_base <= action_index < choose_exhaust_base:
+            return CombatCommand(
+                command_type="choose_discard_target",
+                hand_index=action_index - choose_discard_base,
+            )
+
+        if choose_exhaust_base <= action_index < choose_exhaust_base + max_choose_exhaust:
+            return CombatCommand(
+                command_type="choose_exhaust_target",
+                hand_index=action_index - choose_exhaust_base,
+            )
+
         return CombatCommand(command_type="wait")
 
     def render_text(self) -> None:
@@ -3380,13 +3539,14 @@ class STSEnv:
             print("No state.")
             return
 
-        s = self.state
-        p = s["player"]
+        from typing import Dict, Any
+        s: Dict[str, Any] = self.state
+        p: Dict[str, Any] = s.get("player", {})
 
         print("=" * 60)
         print(
             f"TURN {s.get('turn', '?')} | "
-            f"HP {p.get('current_hp')}/{p.get('max_hp')} | "
+            f"HP {p.get('current_hp', '?')}/{p.get('max_hp', '?')} | "
             f"Block {p.get('block', 0)} | "
             f"Energy {s.get('energy', 0)}"
         )

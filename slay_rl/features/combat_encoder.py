@@ -255,19 +255,11 @@ class CombatEncoder:
         }
 
     def build_valid_action_mask(
-        self,
-        state: Dict[str, Any],
-        hand: Optional[List[ParsedCard]] = None,
-        enemies: Optional[List[ParsedEnemy]] = None,
+            self,
+            state: Dict[str, Any],
+            hand: Optional[List[ParsedCard]] = None,
+            enemies: Optional[List[ParsedEnemy]] = None,
     ) -> List[float]:
-        """
-        Safe action mask:
-        - playable non-target cards
-        - playable targeted cards with valid living targets
-        - usable non-empty non-target potions
-        - targeted potions only when a valid living target exists
-        - end turn remains available during combat
-        """
         hand = hand if hand is not None else self._parse_hand(state)
         enemies = enemies if enemies is not None else self._parse_enemies(state)
 
@@ -278,7 +270,52 @@ class CombatEncoder:
         end_turn_idx = targeted_base + targeted_size
         potion_base = end_turn_idx + 1
         potion_target_base = potion_base + self.max_potions
+        potion_target_size = self.max_potions * self.max_enemies
 
+        max_choose_hand = self.cfg.combat_action.max_choose_hand_actions
+        max_choose_option = self.cfg.combat_action.max_choose_option_actions
+        max_choose_discard = self.cfg.combat_action.max_choose_discard_actions
+        max_choose_exhaust = self.cfg.combat_action.max_choose_exhaust_actions
+
+        choose_hand_base = potion_target_base + potion_target_size
+        choose_option_base = choose_hand_base + max_choose_hand
+        choose_discard_base = choose_option_base + max_choose_option
+        choose_exhaust_base = choose_discard_base + max_choose_discard
+
+        pending_choice = self._extract_pending_choice(state)
+        choice_type = self._normalize_choice_type(pending_choice)
+
+        # ----------------------------------------------------
+        # Choice screen actif -> on masque uniquement les choix
+        # ----------------------------------------------------
+        if pending_choice is not None and choice_type is not None:
+            if choice_type == "choose_option":
+                options = self._pending_choice_options(pending_choice)
+                for i in range(min(len(options), max_choose_option)):
+                    mask[choose_option_base + i] = 1.0
+
+            elif choice_type == "choose_hand_card":
+                for hand_idx in self._pending_choice_hand_indices(state, pending_choice):
+                    if 0 <= hand_idx < max_choose_hand:
+                        mask[choose_hand_base + hand_idx] = 1.0
+
+            elif choice_type == "choose_discard_target":
+                for hand_idx in self._pending_choice_hand_indices(state, pending_choice):
+                    if 0 <= hand_idx < max_choose_discard:
+                        mask[choose_discard_base + hand_idx] = 1.0
+
+            elif choice_type == "choose_exhaust_target":
+                for hand_idx in self._pending_choice_hand_indices(state, pending_choice):
+                    if 0 <= hand_idx < max_choose_exhaust:
+                        mask[choose_exhaust_base + hand_idx] = 1.0
+
+            if sum(mask) == 0:
+                mask[end_turn_idx] = 1.0
+            return mask
+
+        # ----------------------------------------------------
+        # Combat normal
+        # ----------------------------------------------------
         for i in range(self.max_hand_cards):
             if i < len(hand):
                 card = hand[i]
@@ -313,8 +350,7 @@ class CombatEncoder:
             requires_target = bool(potion.get("requires_target", False))
 
             if not requires_target:
-                flat_idx = potion_base + slot_idx
-                mask[flat_idx] = 1.0
+                mask[potion_base + slot_idx] = 1.0
                 continue
 
             for target_idx in range(self.max_enemies):
@@ -326,6 +362,51 @@ class CombatEncoder:
             mask[end_turn_idx] = 1.0
 
         return mask
+
+    def _extract_pending_choice(self, state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        choice = state.get("pending_choice")
+        return choice if isinstance(choice, dict) else None
+
+    def _normalize_choice_type(self, choice: Optional[Dict[str, Any]]) -> Optional[str]:
+        if not isinstance(choice, dict):
+            return None
+
+        raw = str(choice.get("choice_type", choice.get("type", "")) or "").strip().lower()
+        aliases = {
+            "choose_hand_card": "choose_hand_card",
+            "hand_card": "choose_hand_card",
+            "discard": "choose_discard_target",
+            "discard_target": "choose_discard_target",
+            "choose_discard_target": "choose_discard_target",
+            "exhaust": "choose_exhaust_target",
+            "exhaust_target": "choose_exhaust_target",
+            "choose_exhaust_target": "choose_exhaust_target",
+            "option": "choose_option",
+            "choose_option": "choose_option",
+        }
+        return aliases.get(raw)
+
+    def _pending_choice_hand_indices(self, state: Dict[str, Any], choice: Dict[str, Any]) -> List[int]:
+        raw = choice.get("valid_hand_indices", choice.get("hand_indices", None))
+        if isinstance(raw, list):
+            out = []
+            for x in raw:
+                try:
+                    i = int(x)
+                except Exception:
+                    continue
+                if 0 <= i < self.max_hand_cards:
+                    out.append(i)
+            return out
+
+        hand = self._extract_card_list(state, ["hand", "hand_cards", "handCards"])
+        return list(range(min(len(hand), self.max_hand_cards)))
+
+    def _pending_choice_options(self, choice: Dict[str, Any]) -> List[Any]:
+        raw = choice.get("options", choice.get("choices", choice.get("choice_list", [])))
+        if isinstance(raw, list):
+            return raw[: self.cfg.combat_action.max_choose_option_actions]
+        return []
 
     # ========================================================
     # Parsing
@@ -663,24 +744,33 @@ class CombatEncoder:
                 lethalable_enemies += 1
 
         context = [
-            min(safe_float(state.get("turn", 1)) / 20.0, 1.0),                                  # 0
-            min(max(combat_meta.get("cards_played_this_turn", 0), 0) / 10.0, 1.0),            # 1
-            min(max(combat_meta.get("attacks_played_this_turn", 0), 0) / 10.0, 1.0),          # 2
-            min(max(combat_meta.get("attack_counter", 0), 0) / 20.0, 1.0),                    # 3
-            min(max(combat_meta.get("double_tap_charges", 0), 0) / 3.0, 1.0),                 # 4
-            min(max(combat_meta.get("last_x_energy_spent", 0), 0) / 5.0, 1.0),                # 5
-            1.0 if combat_meta.get("cannot_draw_more_this_turn", False) else 0.0,             # 6
-            1.0 if combat_meta.get("next_attack_double", False) else 0.0,                      # 7
-            1.0 if combat_meta.get("first_attack_done", False) else 0.0,                       # 8
-            1.0 if combat_meta.get("is_elite", False) else 0.0,                                # 9
-            1.0 if combat_meta.get("is_boss", False) else 0.0,                                 # 10
-            min(incoming_damage / 80.0, 1.0),                                                  # 11
-            min(len(alive_enemies) / max(self.max_enemies, 1), 1.0),                           # 12
-            min(attacks_in_hand / max(self.max_hand_cards, 1), 1.0),                           # 13
-            min(skills_in_hand / max(self.max_hand_cards, 1), 1.0),                            # 14
-            min(powers_in_hand / max(self.max_hand_cards, 1), 1.0),                            # 15
-            min(playable_cards / max(self.max_hand_cards, 1), 1.0),                            # 16
-            min(usable_potions / max(self.max_potions, 1), 1.0),                               # 17
+            min(safe_float(state.get("turn", 1)) / 20.0, 1.0),  # 0
+            min(max(combat_meta.get("cards_played_this_turn", 0), 0) / 10.0, 1.0),  # 1
+            min(max(combat_meta.get("attacks_played_this_turn", 0), 0) / 10.0, 1.0),  # 2
+            min(max(combat_meta.get("attack_counter", 0), 0) / 20.0, 1.0),  # 3
+            min(max(combat_meta.get("double_tap_charges", 0), 0) / 3.0, 1.0),  # 4
+            min(max(combat_meta.get("last_x_energy_spent", 0), 0) / 5.0, 1.0),  # 5
+            1.0 if combat_meta.get("cannot_draw_more_this_turn", False) else 0.0,  # 6
+            1.0 if combat_meta.get("next_attack_double", False) else 0.0,  # 7
+            1.0 if combat_meta.get("first_attack_done", False) else 0.0,  # 8
+            1.0 if combat_meta.get("is_elite", False) else 0.0,  # 9
+            1.0 if combat_meta.get("is_boss", False) else 0.0,  # 10
+            min(incoming_damage / 80.0, 1.0),  # 11
+            min(len(alive_enemies) / max(self.max_enemies, 1), 1.0),  # 12
+            min(attacks_in_hand / max(self.max_hand_cards, 1), 1.0),  # 13
+            min(skills_in_hand / max(self.max_hand_cards, 1), 1.0),  # 14
+            min(powers_in_hand / max(self.max_hand_cards, 1), 1.0),  # 15
+            min(playable_cards / max(self.max_hand_cards, 1), 1.0),  # 16
+            min(usable_potions / max(self.max_potions, 1), 1.0),  # 17
+
+            min(targeted_cards / max(self.max_hand_cards, 1), 1.0),  # 18
+            min(lethalable_enemies / max(self.max_enemies, 1), 1.0),  # 19
+            min(max(player.energy, 0.0) / 10.0, 1.0),  # 20
+            min(max(player.block, 0.0) / 120.0, 1.0),  # 21
+            clamp_signed(player.strength, 20.0),  # 22
+            clamp_signed(player.dexterity, 20.0),  # 23
+            min(len(hand) / max(self.max_hand_cards, 1), 1.0),  # 24
+            min(sum(1 for e in enemies if not e.alive) / max(self.max_enemies, 1), 1.0),  # 25
         ]
 
         if len(context) != self.combat_context_dim:

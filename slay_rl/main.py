@@ -19,7 +19,7 @@ def main():
     episodes = 1000
 
     # chemin d'un modèle entraîné
-    checkpoint_path = "checkpoints/experiment_3/combat_model_best_robust.pt"
+    checkpoint_path = "checkpoints/experiment_4/combat_model_best_robust.pt"
 
     # pour play_model : test stable
     deterministic_model = True

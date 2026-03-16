@@ -1,4 +1,5 @@
 from __future__ import annotations
+from slay_rl.agents.combat_agent import CombatCommand
 
 
 def test_full_combat_two_strikes_kill_single_enemy(make_state, step_helpers):
@@ -157,3 +158,98 @@ def test_full_combat_offering_then_strike_converts_hp_into_tempo(make_state, ste
 
     assert illegal is False
     assert state["monsters"][0]["current_hp"] < 20
+
+def test_full_combat_choose_discard_target_moves_card_to_discard(make_state, step_helpers):
+    state = make_state(
+        hand=[
+            make_state.card("Strike_R"),
+            make_state.card("Defend_R"),
+            make_state.card("Bash"),
+        ],
+        monsters=[make_state.enemy(hp=30)],
+    )
+    state["pending_choice"] = {
+        "choice_type": "choose_discard_target",
+        "valid_hand_indices": [1],
+    }
+
+    step_helpers.set_state(state)
+    state, illegal = step_helpers.step(
+        CombatCommand(command_type="choose_discard_target", hand_index=1)
+    )
+
+    assert illegal is False
+    assert len(state["hand"]) == 2
+    assert state["discard_pile"][-1]["id"] == "Defend_R"
+    assert "pending_choice" not in state
+
+
+def test_full_combat_choose_exhaust_target_moves_card_to_exhaust(make_state, step_helpers):
+    state = make_state(
+        hand=[
+            make_state.card("Strike_R"),
+            make_state.card("Defend_R"),
+            make_state.card("Inflame"),
+        ],
+        monsters=[make_state.enemy(hp=30)],
+    )
+    state["pending_choice"] = {
+        "choice_type": "choose_exhaust_target",
+        "valid_hand_indices": [2],
+    }
+
+    step_helpers.set_state(state)
+    state, illegal = step_helpers.step(
+        CombatCommand(command_type="choose_exhaust_target", hand_index=2)
+    )
+
+    assert illegal is False
+    assert len(state["hand"]) == 2
+    assert state["exhaust_pile"][-1]["id"] == "Inflame"
+    assert "pending_choice" not in state
+
+
+def test_full_combat_choose_hand_card_puts_card_on_top_of_draw(make_state, step_helpers):
+    state = make_state(
+        hand=[
+            make_state.card("Strike_R"),
+            make_state.card("Defend_R"),
+        ],
+        draw_pile=[make_state.card("Bash")],
+        monsters=[make_state.enemy(hp=30)],
+    )
+    state["pending_choice"] = {
+        "choice_type": "choose_hand_card",
+        "valid_hand_indices": [0],
+    }
+
+    step_helpers.set_state(state)
+    state, illegal = step_helpers.step(
+        CombatCommand(command_type="choose_hand_card", hand_index=0)
+    )
+
+    assert illegal is False
+    assert len(state["hand"]) == 1
+    assert state["draw_pile"][0]["id"] == "Strike_R"
+    assert "pending_choice" not in state
+
+
+def test_full_combat_choose_option_adds_selected_option_to_hand(make_state, step_helpers):
+    state = make_state(
+        hand=[],
+        monsters=[make_state.enemy(hp=30)],
+    )
+    state["pending_choice"] = {
+        "choice_type": "choose_option",
+        "options": ["Anger", "Pommel Strike", "Shrug It Off"],
+    }
+
+    step_helpers.set_state(state)
+    state, illegal = step_helpers.step(
+        CombatCommand(command_type="choose_option", target_index=1)
+    )
+
+    assert illegal is False
+    assert len(state["hand"]) == 1
+    assert state["hand"][0]["id"] == "Pommel Strike"
+    assert "pending_choice" not in state

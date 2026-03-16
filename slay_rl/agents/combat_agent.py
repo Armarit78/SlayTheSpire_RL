@@ -23,16 +23,11 @@ class CombatCommand:
         - "play_card"
         - "end_turn"
         - "use_potion"
+        - "choose_hand_card"
+        - "choose_option"
+        - "choose_discard_target"
+        - "choose_exhaust_target"
         - "wait"
-
-    hand_index:
-        index in current hand if command_type == "play_card"
-
-    target_index:
-        monster index if targeted card
-
-    potion_index:
-        potion slot if command_type == "use_potion"
     """
     command_type: str
     hand_index: Optional[int] = None
@@ -46,7 +41,6 @@ class CombatCommand:
             "target_index": self.target_index,
             "potion_index": self.potion_index,
         }
-
 
 # =========================================================
 # Main combat agent
@@ -133,23 +127,32 @@ class CombatAgent:
             action_index: int,
             state: Dict[str, Any],
     ) -> CombatCommand:
-        """
-        Flat action layout (dynamic):
-        - [0, max_hand_cards) : play card i without target
-        - targeted block      : play card i on target j
-        - end_turn_idx        : end turn
-        """
         hand = self.encoder._parse_hand(state)
         enemies = self.encoder._parse_enemies(state)
+
+        max_potions = self.cfg.combat_obs.max_potions
+        max_choose_hand = self.cfg.combat_action.max_choose_hand_actions
+        max_choose_option = self.cfg.combat_action.max_choose_option_actions
+        max_choose_discard = self.cfg.combat_action.max_choose_discard_actions
+        max_choose_exhaust = self.cfg.combat_action.max_choose_exhaust_actions
 
         targeted_base = self.max_hand_cards
         targeted_size = self.max_hand_cards * self.max_enemies
         end_turn_idx = targeted_base + targeted_size
 
-        max_potions = self.cfg.combat_obs.max_potions
         potion_base = end_turn_idx + 1
         potion_target_base = potion_base + max_potions
         potion_target_size = max_potions * self.max_enemies
+
+        choose_hand_base = potion_target_base + potion_target_size
+        choose_option_base = choose_hand_base + max_choose_hand
+        choose_discard_base = choose_option_base + max_choose_option
+        choose_exhaust_base = choose_discard_base + max_choose_discard
+
+        pending = self.encoder._extract_pending_choice(state)
+        choice_type = self.encoder._normalize_choice_type(pending)
+        valid_hand_indices = self.encoder._pending_choice_hand_indices(state, pending) if pending else []
+        options = self.encoder._pending_choice_options(pending) if pending else []
 
         if 0 <= action_index < self.max_hand_cards:
             hand_index = action_index
@@ -202,6 +205,30 @@ class CombatAgent:
                 )
             return CombatCommand(command_type="wait")
 
+        if choose_hand_base <= action_index < choose_hand_base + max_choose_hand:
+            hand_index = action_index - choose_hand_base
+            if choice_type == "choose_hand_card" and hand_index in valid_hand_indices:
+                return CombatCommand(command_type="choose_hand_card", hand_index=hand_index)
+            return CombatCommand(command_type="wait")
+
+        if choose_option_base <= action_index < choose_option_base + max_choose_option:
+            option_index = action_index - choose_option_base
+            if choice_type == "choose_option" and option_index < len(options):
+                return CombatCommand(command_type="choose_option", target_index=option_index)
+            return CombatCommand(command_type="wait")
+
+        if choose_discard_base <= action_index < choose_discard_base + max_choose_discard:
+            hand_index = action_index - choose_discard_base
+            if choice_type == "choose_discard_target" and hand_index in valid_hand_indices:
+                return CombatCommand(command_type="choose_discard_target", hand_index=hand_index)
+            return CombatCommand(command_type="wait")
+
+        if choose_exhaust_base <= action_index < choose_exhaust_base + max_choose_exhaust:
+            hand_index = action_index - choose_exhaust_base
+            if choice_type == "choose_exhaust_target" and hand_index in valid_hand_indices:
+                return CombatCommand(command_type="choose_exhaust_target", hand_index=hand_index)
+            return CombatCommand(command_type="wait")
+
         return CombatCommand(command_type="wait")
 
     def command_to_spirecomm_action(
@@ -234,6 +261,19 @@ class CombatAgent:
             return {
                 "action_type": "use_potion",
                 "potion_index": command.potion_index,
+                "target_index": command.target_index,
+            }
+
+        if command.command_type in {
+            "choose_hand_card",
+            "choose_option",
+            "choose_discard_target",
+            "choose_exhaust_target",
+        }:
+            return {
+                "action_type": "choose",
+                "choice_type": command.command_type,
+                "hand_index": command.hand_index,
                 "target_index": command.target_index,
             }
 
@@ -407,11 +447,23 @@ def encode_command_to_action_index(
     max_enemies = cfg.combat_obs.max_enemies
     max_potions = cfg.combat_obs.max_potions
 
+    max_choose_hand = cfg.combat_action.max_choose_hand_actions
+    max_choose_option = cfg.combat_action.max_choose_option_actions
+    max_choose_discard = cfg.combat_action.max_choose_discard_actions
+    max_choose_exhaust = cfg.combat_action.max_choose_exhaust_actions
+
     targeted_base = max_hand_cards
     targeted_size = max_hand_cards * max_enemies
     end_turn_idx = targeted_base + targeted_size
+
     potion_base = end_turn_idx + 1
     potion_target_base = potion_base + max_potions
+    potion_target_size = max_potions * max_enemies
+
+    choose_hand_base = potion_target_base + potion_target_size
+    choose_option_base = choose_hand_base + max_choose_hand
+    choose_discard_base = choose_option_base + max_choose_option
+    choose_exhaust_base = choose_discard_base + max_choose_discard
 
     if command.command_type == "play_card":
         if command.hand_index is None:
@@ -440,12 +492,28 @@ def encode_command_to_action_index(
             return potion_base + command.potion_index
 
         if 0 <= command.target_index < max_enemies:
-            return (
-                    potion_target_base
-                    + command.potion_index * max_enemies
-                    + command.target_index
-            )
+            return potion_target_base + command.potion_index * max_enemies + command.target_index
 
+        return end_turn_idx
+
+    if command.command_type == "choose_hand_card":
+        if command.hand_index is not None and 0 <= command.hand_index < max_choose_hand:
+            return choose_hand_base + command.hand_index
+        return end_turn_idx
+
+    if command.command_type == "choose_option":
+        if command.target_index is not None and 0 <= command.target_index < max_choose_option:
+            return choose_option_base + command.target_index
+        return end_turn_idx
+
+    if command.command_type == "choose_discard_target":
+        if command.hand_index is not None and 0 <= command.hand_index < max_choose_discard:
+            return choose_discard_base + command.hand_index
+        return end_turn_idx
+
+    if command.command_type == "choose_exhaust_target":
+        if command.hand_index is not None and 0 <= command.hand_index < max_choose_exhaust:
+            return choose_exhaust_base + command.hand_index
         return end_turn_idx
 
     return end_turn_idx
@@ -724,6 +792,18 @@ class SpireCommActionAdapter:
                 "action_type": "use_potion",
                 "potion_index": command.potion_index,
                 "target_index": command.target_index,
+            }
+
+        if command.command_type == "choose_option":
+            return {
+                "action_type": "choose",
+                "choice_index": command.target_index,
+            }
+
+        if command.command_type in {"choose_hand_card", "choose_discard_target", "choose_exhaust_target"}:
+            return {
+                "action_type": "choose",
+                "choice_index": command.hand_index,
             }
 
         return {"action_type": "wait"}

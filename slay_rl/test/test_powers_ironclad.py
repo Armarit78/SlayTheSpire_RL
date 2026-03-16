@@ -20,8 +20,8 @@ def test_feel_no_pain_gains_block_when_card_exhausts(make_state, step_helpers):
     next_state, illegal = step_helpers.play_card(hand_index=0)
 
     assert illegal is False
-    assert next_state["player"]["block"] == 16
-    assert [c["id"] for c in next_state["exhaust_pile"]] == ["Second Wind", "Defend_R"]
+    assert next_state["player"]["block"] == 11
+    assert sorted(c["id"] for c in next_state["exhaust_pile"]) == ["Defend_R", "Second Wind"]
 
 
 def test_dark_embrace_draws_when_card_is_exhausted(make_state, step_helpers):

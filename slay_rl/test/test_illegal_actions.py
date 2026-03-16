@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+from slay_rl.agents.combat_agent import CombatCommand
 
 
 def test_cannot_play_card_without_enough_energy(make_state, step_helpers):
@@ -162,3 +162,74 @@ def test_cannot_play_missing_hand_slot(make_state, step_helpers):
     assert illegal is True
     assert next_state["hand"][0]["id"] == "Strike_R"
     assert next_state["monsters"][0]["current_hp"] == 30
+
+def test_choose_option_without_pending_choice_is_illegal(make_state, step_helpers):
+    state = make_state(
+        hand=[make_state.card("Strike_R")],
+        monsters=[make_state.enemy(hp=30)],
+    )
+    step_helpers.set_state(state)
+
+    next_state, illegal = step_helpers.step(CombatCommand(command_type="choose_option", target_index=0))
+
+    assert illegal is True
+    assert "pending_choice" not in next_state
+
+
+def test_choose_discard_target_with_invalid_hand_index_is_illegal(make_state, step_helpers):
+    state = make_state(
+        hand=[make_state.card("Strike_R"), make_state.card("Defend_R")],
+        monsters=[make_state.enemy(hp=30)],
+    )
+    state["pending_choice"] = {
+        "choice_type": "choose_discard_target",
+        "valid_hand_indices": [1],
+    }
+    step_helpers.set_state(state)
+
+    next_state, illegal = step_helpers.step(
+        CombatCommand(command_type="choose_discard_target", hand_index=0)
+    )
+
+    assert illegal is True
+    assert len(next_state["hand"]) == 2
+    assert len(next_state["discard_pile"]) == 0
+
+
+def test_choose_exhaust_target_with_missing_index_is_illegal(make_state, step_helpers):
+    state = make_state(
+        hand=[make_state.card("Strike_R"), make_state.card("Defend_R")],
+        monsters=[make_state.enemy(hp=30)],
+    )
+    state["pending_choice"] = {
+        "choice_type": "choose_exhaust_target",
+        "valid_hand_indices": [0, 1],
+    }
+    step_helpers.set_state(state)
+
+    next_state, illegal = step_helpers.step(
+        CombatCommand(command_type="choose_exhaust_target", hand_index=None)
+    )
+
+    assert illegal is True
+    assert len(next_state["hand"]) == 2
+    assert len(next_state["exhaust_pile"]) == 0
+
+
+def test_choose_option_out_of_range_is_illegal(make_state, step_helpers):
+    state = make_state(
+        hand=[],
+        monsters=[make_state.enemy(hp=30)],
+    )
+    state["pending_choice"] = {
+        "choice_type": "choose_option",
+        "options": ["Anger", "Pommel Strike"],
+    }
+    step_helpers.set_state(state)
+
+    next_state, illegal = step_helpers.step(
+        CombatCommand(command_type="choose_option", target_index=4)
+    )
+
+    assert illegal is True
+    assert len(next_state["hand"]) == 0

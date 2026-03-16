@@ -168,6 +168,10 @@ def step_helpers(env_api, backend):
             return backend.state
 
         @staticmethod
+        def step(command):
+            return backend.step(command)
+
+        @staticmethod
         def play_card(hand_index: int, target_index: Optional[int] = None):
             return backend.step(
                 CombatCommand(

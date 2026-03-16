@@ -338,7 +338,7 @@ class CombatObsConfig:
     player_scalar_dim: int = 25
     enemy_scalar_dim: int = 57
     potion_scalar_dim: int = 21
-    combat_context_dim: int = 18
+    combat_context_dim: int = 26
 
     @property
     def card_vocab_size(self) -> int:
@@ -377,7 +377,14 @@ class CombatActionConfig:
     max_target_actions: int = 5
     allow_end_turn: bool = True
     allow_potions: bool = True
-    total_actions: int = 91
+
+    # new combat choice actions
+    max_choose_hand_actions: int = 10
+    max_choose_option_actions: int = 5
+    max_choose_discard_actions: int = 10
+    max_choose_exhaust_actions: int = 10
+
+    total_actions: int = 126
 
 
 @dataclass
