@@ -145,9 +145,11 @@ class CombatAgent:
         targeted_base = self.max_hand_cards
         targeted_size = self.max_hand_cards * self.max_enemies
         end_turn_idx = targeted_base + targeted_size
+
+        max_potions = self.cfg.combat_obs.max_potions
         potion_base = end_turn_idx + 1
-        potion_target_base = potion_base + 5
-        potion_target_size = 5 * self.max_enemies
+        potion_target_base = potion_base + max_potions
+        potion_target_size = max_potions * self.max_enemies
 
         if 0 <= action_index < self.max_hand_cards:
             hand_index = action_index
@@ -180,7 +182,7 @@ class CombatAgent:
         if action_index == end_turn_idx:
             return CombatCommand(command_type="end_turn")
 
-        if potion_base <= action_index < potion_base + 5:
+        if potion_base <= action_index < potion_base + max_potions:
             return CombatCommand(
                 command_type="use_potion",
                 potion_index=action_index - potion_base,
@@ -403,12 +405,13 @@ def encode_command_to_action_index(
     cfg = cfg or get_default_config()
     max_hand_cards = cfg.combat_obs.max_hand_cards
     max_enemies = cfg.combat_obs.max_enemies
+    max_potions = cfg.combat_obs.max_potions
 
     targeted_base = max_hand_cards
     targeted_size = max_hand_cards * max_enemies
     end_turn_idx = targeted_base + targeted_size
     potion_base = end_turn_idx + 1
-    potion_target_base = potion_base + 5
+    potion_target_base = potion_base + max_potions
 
     if command.command_type == "play_card":
         if command.hand_index is None:
@@ -430,7 +433,7 @@ def encode_command_to_action_index(
         return end_turn_idx
 
     if command.command_type == "use_potion":
-        if command.potion_index is None or not (0 <= command.potion_index < 5):
+        if command.potion_index is None or not (0 <= command.potion_index < max_potions):
             return end_turn_idx
 
         if command.target_index is None:

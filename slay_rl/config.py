@@ -394,8 +394,8 @@ class PPOConfig:
     gamma: float = 0.995
     gae_lambda: float = 0.97
     clip_eps: float = 0.2
-    value_coef: float = 0.5
-    entropy_coef: float = 0.007
+    value_coef: float = 0.25
+    entropy_coef: float = 0.012
     lr: float = 2e-4
     batch_size: int = 1024
     rollout_steps: int = 8192
@@ -407,14 +407,14 @@ class PPOConfig:
 class TrainConfig:
     seed: int = 32
     device: str = "cuda"
-    run_name: str = "experiment_2_vec_bigrollout"
+    run_name: str = "experiment_4"
 
     total_updates: int = 1200
     save_every: int = 50
     log_every: int = 10
     eval_every: int = 20
 
-    eval_num_episodes: int = 20
+    eval_num_episodes: int = 50
     eval_seed_start: int = 100000
 
     robust_eval_every: int = 50
@@ -436,8 +436,8 @@ class CombatCurriculumConfig:
     enabled: bool = True
     phases: list[CurriculumPhaseConfig] = field(default_factory=lambda: [
         CurriculumPhaseConfig(until_update=300, elite_chance=0.10, boss_chance=0.00),
-        CurriculumPhaseConfig(until_update=700, elite_chance=0.20, boss_chance=0.05),
-        CurriculumPhaseConfig(until_update=10_000_000, elite_chance=0.25, boss_chance=0.12),
+        CurriculumPhaseConfig(until_update=700, elite_chance=0.13, boss_chance=0.02),
+        CurriculumPhaseConfig(until_update=10_000_000, elite_chance=0.17, boss_chance=0.06),
     ])
 
 
@@ -452,9 +452,9 @@ class CombatRewardConfig:
     illegal_action_penalty: float = -0.50
 
     # Tempo / stalling
-    end_turn_small_penalty: float = -0.03
-    wasted_energy_penalty_scale: float = -0.020
-    good_energy_use_reward_scale: float = 0.010
+    end_turn_small_penalty: float = -0.06
+    wasted_energy_penalty_scale: float = -0.035
+    good_energy_use_reward_scale: float = 0.006
 
     # Defensive quality
     useful_block_scale: float = 0.012
@@ -475,19 +475,19 @@ class CombatRewardConfig:
     intangible_gain_scale: float = 0.040
 
     # Setup / sequencing
-    rage_setup_scale: float = 0.030
-    double_tap_setup_scale: float = 0.080
-    inflame_setup_scale: float = 0.045
-    spot_weakness_setup_scale: float = 0.050
-    corruption_setup_scale: float = 0.060
-    barricade_setup_scale: float = 0.050
-    feel_no_pain_setup_scale: float = 0.040
-    dark_embrace_setup_scale: float = 0.035
-    demon_form_setup_scale: float = 0.070
-    evolve_setup_scale: float = 0.030
-    combust_setup_scale: float = 0.020
-    juggernaut_setup_scale: float = 0.040
-    rupture_setup_scale: float = 0.030
+    rage_setup_scale: float = 0.015
+    double_tap_setup_scale: float = 0.035
+    inflame_setup_scale: float = 0.020
+    spot_weakness_setup_scale: float = 0.020
+    corruption_setup_scale: float = 0.025
+    barricade_setup_scale: float = 0.020
+    feel_no_pain_setup_scale: float = 0.020
+    dark_embrace_setup_scale: float = 0.015
+    demon_form_setup_scale: float = 0.030
+    evolve_setup_scale: float = 0.015
+    combust_setup_scale: float = 0.010
+    juggernaut_setup_scale: float = 0.015
+    rupture_setup_scale: float = 0.010
 
     # Lethal / focus
     lethal_reward_scale: float = 0.080
@@ -498,11 +498,11 @@ class CombatRewardConfig:
     self_bad_hp_loss_scale: float = -0.030
 
     # Potions
-    potion_low_threat_penalty: float = -0.020
-    potion_medium_threat_penalty: float = -0.006
-    potion_high_threat_penalty: float = -0.001
-    potion_emergency_bonus: float = 0.030
-    potion_lethal_bonus: float = 0.040
+    potion_low_threat_penalty: float = -0.040
+    potion_medium_threat_penalty: float = -0.015
+    potion_high_threat_penalty: float = -0.003
+    potion_emergency_bonus: float = 0.015
+    potion_lethal_bonus: float = 0.020
 
 
 @dataclass

@@ -303,3 +303,85 @@ def test_flatten_combat_obs_includes_new_blocks(make_state):
 
     assert flat.ndim == 1
     assert flat.numel() == expected
+
+def test_encoder_marks_dead_enemy_slots_as_not_targetable(make_state):
+    encoder = CombatEncoder()
+
+    dead_enemy = make_state.enemy(hp=0, intent="ATTACK", intent_base_damage=8)
+    dead_enemy["isDead"] = True
+
+    state = make_state(
+        hand=[make_state.card("Bash")],
+        monsters=[dead_enemy, make_state.enemy(name="Cultist", hp=25, intent="BUFF", intent_base_damage=0)],
+        energy=3,
+    )
+
+    encoded = encoder.encode(state)
+
+    assert encoded["enemy_mask"].tolist()[:5] == [0.0, 1.0, 0.0, 0.0, 0.0]
+
+    mask = encoded["valid_action_mask"].tolist()
+    bash_t0 = 10 + 0 * 5 + 0
+    bash_t1 = 10 + 0 * 5 + 1
+
+    assert mask[bash_t0] == 0.0
+    assert mask[bash_t1] == 1.0
+
+
+def test_encoder_player_scalars_capture_zero_incoming_damage_state(make_state):
+    encoder = CombatEncoder()
+
+    state = make_state(
+        hand=[make_state.card("Defend_R")],
+        monsters=[make_state.enemy(hp=30, intent="BUFF", intent_base_damage=0)],
+        hp=50,
+        max_hp=80,
+        block=0,
+        energy=1,
+        player_powers=[],
+        combat_meta={"double_tap_charges": 0},
+    )
+
+    encoded = encoder.encode(state)
+    player = encoded["player_scalars"]
+
+    assert player[23].item() == pytest.approx(0.0)
+
+
+def test_encoder_combat_context_distinguishes_elite_and_boss_flags(make_state):
+    encoder = CombatEncoder()
+
+    elite_state = make_state(
+        hand=[make_state.card("Strike_R")],
+        monsters=[make_state.enemy(hp=40)],
+        combat_meta={"is_elite": True, "is_boss": False},
+    )
+    boss_state = make_state(
+        hand=[make_state.card("Strike_R")],
+        monsters=[make_state.enemy(hp=150)],
+        combat_meta={"is_elite": False, "is_boss": True},
+    )
+
+    elite_ctx = encoder.encode(elite_state)["combat_context"]
+    boss_ctx = encoder.encode(boss_state)["combat_context"]
+
+    assert elite_ctx[9].item() == 1.0
+    assert elite_ctx[10].item() == 0.0
+    assert boss_ctx[9].item() == 0.0
+    assert boss_ctx[10].item() == 1.0
+
+
+def test_encoder_hand_mask_zeroes_unused_slots(make_state):
+    encoder = CombatEncoder()
+
+    state = make_state(
+        hand=[make_state.card("Strike_R"), make_state.card("Defend_R")],
+        monsters=[make_state.enemy()],
+    )
+
+    encoded = encoder.encode(state)
+    hand_mask = encoded["hand_mask"].tolist()
+
+    assert hand_mask[0] == 1.0
+    assert hand_mask[1] == 1.0
+    assert hand_mask[2:] == [0.0] * (len(hand_mask) - 2)

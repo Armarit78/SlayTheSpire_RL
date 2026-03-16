@@ -15,12 +15,11 @@ def main():
     # "play_random"
     # "train"
 
-    render = True
-    episodes = 1
+    render = False
+    episodes = 1000
 
     # chemin d'un modèle entraîné
-    checkpoint_path = "checkpoints/experiment_2_vec_bigrollout/combat_model_update_1100.pt"
-    #checkpoint_path = "checkpoints/experiment_1/combat_model_update_950.pt"
+    checkpoint_path = "checkpoints/experiment_3/combat_model_best_robust.pt"
 
     # pour play_model : test stable
     deterministic_model = True
@@ -47,7 +46,7 @@ def main():
                 render=render,
                 seed=ep,
             )
-            print("\nEpisode result.txt:")
+            print("\nEpisode resultv2.txt:")
             print(result.to_dict())
             save_episode(result, ep + 1, mode)
         return
@@ -67,7 +66,7 @@ def main():
 
             results.append(result)
 
-            print("\nEpisode result.txt:")
+            print("\nEpisode resultv2.txt:")
             print(result.to_dict())
             save_episode(result, ep + 1, mode)
 
@@ -134,7 +133,7 @@ def main():
 
             results.append(result)
 
-            print("\nEpisode result.txt:")
+            print("\nEpisode resultv2.txt:")
             print(result.to_dict())
             save_episode(result, ep + 1, mode)
 

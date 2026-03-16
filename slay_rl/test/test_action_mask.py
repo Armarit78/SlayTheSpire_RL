@@ -3,8 +3,6 @@ from __future__ import annotations
 from slay_rl.features.combat_encoder import CombatEncoder
 from slay_rl.agents.combat_agent import encode_command_to_action_index, CombatCommand
 
-
-
 def test_action_mask_marks_playable_non_target_card_and_end_turn(make_state):
     encoder = CombatEncoder()
     state = make_state(
@@ -82,3 +80,65 @@ def test_encode_command_to_action_index_round_trip_layout():
     assert end_turn == 60
     assert potion == 62
     assert targeted_potion == 66 + 2 * 5 + 3
+
+def test_action_mask_disables_end_turn_only_when_no_general_rule_forbids_it(make_state):
+    encoder = CombatEncoder()
+    state = make_state(
+        hand=[make_state.card("Strike_R")],
+        monsters=[make_state.enemy(hp=30)],
+        energy=1,
+    )
+
+    encoded = encoder.encode(state)
+    mask = encoded["valid_action_mask"].tolist()
+
+    end_turn_idx = 10 + 10 * 5
+    assert mask[end_turn_idx] == 1.0
+
+
+def test_action_mask_marks_only_living_targets_for_targeted_potion(make_state):
+    encoder = CombatEncoder()
+    potions = [
+        {"name": "Fear Potion", "usable": True, "empty": False, "requires_target": True},
+        *[{"name": "Empty Slot", "usable": False, "empty": True, "requires_target": False} for _ in range(4)],
+    ]
+
+    dead_enemy = make_state.enemy(hp=0)
+    dead_enemy["isDead"] = True
+
+    state = make_state(
+        hand=[],
+        monsters=[make_state.enemy(hp=40), dead_enemy],
+        potions=potions,
+    )
+
+    encoded = encoder.encode(state)
+    mask = encoded["valid_action_mask"].tolist()
+
+    end_turn_idx = 10 + 10 * 5
+    potion_base = end_turn_idx + 1
+    potion_target_base = potion_base + 5
+
+    fear_t0 = potion_target_base + 0 * 5 + 0
+    fear_t1 = potion_target_base + 0 * 5 + 1
+
+    assert mask[potion_base + 0] == 0.0
+    assert mask[fear_t0] == 1.0
+    assert mask[fear_t1] == 0.0
+
+
+def test_action_mask_disables_unplayable_hand_slots_beyond_current_hand(make_state):
+    encoder = CombatEncoder()
+    state = make_state(
+        hand=[make_state.card("Strike_R")],
+        monsters=[make_state.enemy(hp=40)],
+        energy=1,
+    )
+
+    encoded = encoder.encode(state)
+    mask = encoded["valid_action_mask"].tolist()
+
+    # Strike_R est ciblée : le slot non-targeted peut rester à 0, mais les slots de main inexistants doivent rester inactifs.
+    assert mask[1] == 0.0
+    assert mask[2] == 0.0
+    assert mask[9] == 0.0

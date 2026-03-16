@@ -453,7 +453,8 @@ def compute_ppo_loss(
     surr2 = torch.clamp(ratios, 1.0 - clip_eps, 1.0 + clip_eps) * batch_advantages
     policy_loss = -torch.min(surr1, surr2).mean()
 
-    value_loss = F.mse_loss(values, batch_returns)
+    # Huber loss à la place de MSE
+    value_loss = F.smooth_l1_loss(values, batch_returns)
 
     entropy_loss = -entropy.mean()
 

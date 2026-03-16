@@ -17,7 +17,7 @@ EPISODE_DIR = Path("data/episodes")
 EPISODE_DIR.mkdir(parents=True, exist_ok=True)
 
 # =========================================================
-# Episode result.txt
+# Episode resultv2.txt
 # =========================================================
 
 @dataclass
@@ -336,7 +336,7 @@ def quick_test() -> None:
         render=True,
         seed=42,
     )
-    print("\nFinal result.txt:")
+    print("\nFinal resultv2.txt:")
     print(result.to_dict())
 
 # =========================================================

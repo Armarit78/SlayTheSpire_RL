@@ -323,3 +323,158 @@ def test_reward_status_curse_reduction_is_rewarded(make_state):
     out = calc.compute(prev_state, next_state, action_info={"command_type": "play_card"})
 
     assert out.status_curse_hand_reward > 0.0
+
+def test_reward_win_must_outweigh_small_setup_gain(make_state):
+    calc = CombatRewardCalculator()
+
+    prev_setup = make_state(
+        hand=[make_state.card("Inflame"), make_state.card("Strike_R")],
+        monsters=[make_state.enemy(hp=8, intent="ATTACK", intent_base_damage=8)],
+        hp=40,
+        energy=2,
+        player_powers=[],
+        combat_meta={"cards_played_this_turn": 0, "attacks_played_this_turn": 0, "double_tap_charges": 0},
+    )
+    next_setup = make_state(
+        hand=[make_state.card("Strike_R")],
+        monsters=[make_state.enemy(hp=8, intent="ATTACK", intent_base_damage=8)],
+        hp=40,
+        energy=1,
+        player_powers=[{"id": "Strength", "amount": 2}],
+        combat_meta={"cards_played_this_turn": 1, "attacks_played_this_turn": 0, "double_tap_charges": 0},
+    )
+
+    prev_kill = make_state(
+        hand=[make_state.card("Strike_R"), make_state.card("Inflame")],
+        monsters=[make_state.enemy(hp=6, intent="ATTACK", intent_base_damage=8)],
+        hp=40,
+        energy=1,
+        player_powers=[],
+        combat_meta={"cards_played_this_turn": 0, "attacks_played_this_turn": 0, "double_tap_charges": 0},
+    )
+    dead_enemy = make_state.enemy(hp=0, intent="ATTACK", intent_base_damage=8)
+    dead_enemy["isDead"] = True
+    next_kill = make_state(
+        hand=[make_state.card("Inflame")],
+        monsters=[dead_enemy],
+        hp=40,
+        energy=0,
+        player_powers=[],
+        combat_meta={"cards_played_this_turn": 1, "attacks_played_this_turn": 1, "double_tap_charges": 0},
+    )
+    next_kill["combat_over"] = True
+    next_kill["victory"] = True
+
+    out_setup = calc.compute(
+        prev_setup,
+        next_setup,
+        action_info={"command_type": "play_card", "card_name": "Inflame", "illegal_action": False},
+    )
+    out_kill = calc.compute(
+        prev_kill,
+        next_kill,
+        action_info={"command_type": "play_card", "card_name": "Strike_R", "illegal_action": False},
+    )
+
+    assert out_setup.setup_reward > 0.0
+    assert out_kill.combat_won is True
+    assert out_kill.total_reward > out_setup.total_reward
+
+
+def test_reward_survival_block_should_outweigh_do_nothing_end_turn(make_state):
+    calc = CombatRewardCalculator()
+
+    prev_block = make_state(
+        hand=[make_state.card("Defend_R")],
+        monsters=[make_state.enemy(hp=30, intent="ATTACK", intent_base_damage=18)],
+        hp=12,
+        block=0,
+        energy=1,
+    )
+    next_block = make_state(
+        hand=[],
+        monsters=[make_state.enemy(hp=30, intent="ATTACK", intent_base_damage=18)],
+        hp=12,
+        block=5,
+        energy=0,
+    )
+
+    prev_idle = make_state(
+        hand=[make_state.card("Defend_R")],
+        monsters=[make_state.enemy(hp=30, intent="ATTACK", intent_base_damage=18)],
+        hp=12,
+        block=0,
+        energy=1,
+    )
+    next_idle = make_state(
+        hand=[make_state.card("Defend_R")],
+        monsters=[make_state.enemy(hp=30, intent="ATTACK", intent_base_damage=18)],
+        hp=12,
+        block=0,
+        energy=1,
+    )
+
+    out_block = calc.compute(
+        prev_block,
+        next_block,
+        action_info={"command_type": "play_card", "card_name": "Defend_R", "illegal_action": False},
+    )
+    out_idle = calc.compute(
+        prev_idle,
+        next_idle,
+        action_info={"command_type": "end_turn", "illegal_action": False},
+    )
+
+    assert out_block.block_reward > 0.0
+    assert out_idle.energy_reward < 0.0
+    assert out_block.total_reward > out_idle.total_reward
+
+
+def test_reward_should_not_prefer_stalling_over_finishing_combat(make_state):
+    calc = CombatRewardCalculator()
+
+    prev_finish = make_state(
+        hand=[make_state.card("Strike_R")],
+        monsters=[make_state.enemy(hp=6, intent="BUFF", intent_base_damage=0)],
+        hp=50,
+        energy=1,
+    )
+    dead_enemy = make_state.enemy(hp=0, intent="BUFF", intent_base_damage=0)
+    dead_enemy["isDead"] = True
+    next_finish = make_state(
+        hand=[],
+        monsters=[dead_enemy],
+        hp=50,
+        energy=0,
+    )
+    next_finish["combat_over"] = True
+    next_finish["victory"] = True
+
+    prev_stall = make_state(
+        hand=[make_state.card("Defend_R")],
+        monsters=[make_state.enemy(hp=6, intent="BUFF", intent_base_damage=0)],
+        hp=50,
+        energy=1,
+        block=0,
+    )
+    next_stall = make_state(
+        hand=[],
+        monsters=[make_state.enemy(hp=6, intent="BUFF", intent_base_damage=0)],
+        hp=50,
+        energy=0,
+        block=5,
+    )
+
+    out_finish = calc.compute(
+        prev_finish,
+        next_finish,
+        action_info={"command_type": "play_card", "card_name": "Strike_R", "illegal_action": False},
+    )
+    out_stall = calc.compute(
+        prev_stall,
+        next_stall,
+        action_info={"command_type": "play_card", "card_name": "Defend_R", "illegal_action": False},
+    )
+
+    assert out_finish.combat_won is True
+    assert out_finish.total_reward > out_stall.total_reward

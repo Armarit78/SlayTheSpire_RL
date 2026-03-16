@@ -3279,10 +3279,38 @@ class STSEnv:
         prev_state = copy.deepcopy(self.state)
         next_state, illegal_action = self.backend.step(command)
 
+        played_card_name = ""
+        played_card = None
+
+        if command.command_type == "play_card" and command.hand_index is not None:
+            hand = prev_state.get("hand", [])
+            if isinstance(hand, list) and 0 <= command.hand_index < len(hand):
+                candidate = hand[command.hand_index]
+                if isinstance(candidate, dict):
+                    played_card = copy.deepcopy(candidate)
+                    played_card_name = str(
+                        candidate.get(
+                            "id",
+                            candidate.get(
+                                "card_id",
+                                candidate.get("name", "")
+                            )
+                        )
+                    )
+
         reward_out: CombatRewardOutput = self.reward_calculator.compute(
             prev_state=prev_state,
             next_state=next_state,
-            action_info={"illegal_action": illegal_action, "command_type": command.command_type},
+            action_info={
+                "illegal_action": illegal_action,
+                "command_type": command.command_type,
+                "action_type": command.command_type,
+                "played_card_name": played_card_name,
+                "played_card": played_card,
+                "hand_index": command.hand_index,
+                "target_index": command.target_index,
+                "potion_index": command.potion_index,
+            },
         )
 
         self.state = copy.deepcopy(next_state)
@@ -3307,13 +3335,14 @@ class STSEnv:
     def decode_action_index(self, action_index: int, state: Dict[str, Any]) -> CombatCommand:
         max_hand_cards = self.cfg.combat_obs.max_hand_cards
         max_enemies = self.cfg.combat_obs.max_enemies
+        max_potions = self.cfg.combat_obs.max_potions
 
         targeted_base = max_hand_cards
         targeted_size = max_hand_cards * max_enemies
         end_turn_idx = targeted_base + targeted_size
         potion_base = end_turn_idx + 1
-        potion_target_base = potion_base + 5
-        potion_target_size = 5 * max_enemies
+        potion_target_base = potion_base + max_potions
+        potion_target_size = max_potions * max_enemies
 
         if 0 <= action_index < max_hand_cards:
             return CombatCommand(command_type="play_card", hand_index=action_index, target_index=None)
@@ -3327,7 +3356,7 @@ class STSEnv:
         if action_index == end_turn_idx:
             return CombatCommand(command_type="end_turn")
 
-        if potion_base <= action_index < potion_base + 5:
+        if potion_base <= action_index < potion_base + max_potions:
             return CombatCommand(
                 command_type="use_potion",
                 potion_index=action_index - potion_base,

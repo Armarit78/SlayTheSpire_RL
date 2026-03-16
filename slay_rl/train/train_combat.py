@@ -87,11 +87,6 @@ class RolloutBuffer:
             dtype=torch.float32,
         )
 
-        # normalize advantages
-        adv_mean = batch_advantages.mean()
-        adv_std = batch_advantages.std(unbiased=False)
-        batch_advantages = (batch_advantages - adv_mean) / (adv_std + 1e-8)
-
         return {
             "obs": batch_obs,
             "actions": batch_actions,
@@ -276,6 +271,28 @@ class CombatTrainer:
             "values": [float(v) for v in values],
         }
 
+    def _concat_rollout_batches(
+            self,
+            env_batches: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        if len(env_batches) == 0:
+            raise RuntimeError("No env batches to concatenate.")
+
+        obs_keys = env_batches[0]["obs"].keys()
+
+        batch_obs = {
+            k: torch.cat([b["obs"][k] for b in env_batches], dim=0)
+            for k in obs_keys
+        }
+
+        return {
+            "obs": batch_obs,
+            "actions": torch.cat([b["actions"] for b in env_batches], dim=0),
+            "old_log_probs": torch.cat([b["old_log_probs"] for b in env_batches], dim=0),
+            "returns": torch.cat([b["returns"] for b in env_batches], dim=0),
+            "advantages": torch.cat([b["advantages"] for b in env_batches], dim=0),
+        }
+
     def collect_rollout(
             self,
             rollout_steps: Optional[int] = None,
@@ -283,7 +300,7 @@ class CombatTrainer:
     ) -> Dict[str, Any]:
         rollout_steps = rollout_steps or self.cfg.ppo.rollout_steps
 
-        buffer = RolloutBuffer()
+        buffers = [RolloutBuffer() for _ in range(self.num_envs)]
         episode_rewards: List[float] = []
         episode_lengths: List[int] = []
         episode_wins: List[int] = []
@@ -314,7 +331,7 @@ class CombatTrainer:
             next_states, rewards, dones, infos = self.vec_env.step(actions)
 
             for env_idx in range(self.num_envs):
-                buffer.add(
+                buffers[env_idx].add(
                     Transition(
                         encoded_obs=encoded_list[env_idx],
                         action=actions[env_idx],
@@ -338,7 +355,7 @@ class CombatTrainer:
 
             states = next_states
 
-        # bootstrap value (approximation simple)
+        # bootstrap value par environnement
         with torch.no_grad():
             encoded_list = [
                 self.agent.encoder.encode(state, device=self.device)
@@ -348,14 +365,19 @@ class CombatTrainer:
             batch_obs = {k: v.to(self.device) for k, v in batch_obs.items()}
 
             out = self.model.forward(batch_obs)
-            last_values = out["value"].detach().cpu().tolist()
-            last_value = sum(float(v) for v in last_values) / max(len(last_values), 1)
+            last_values = [float(v) for v in out["value"].detach().cpu().tolist()]
 
-        batch = buffer.compute_returns_and_advantages(
-            gamma=self.cfg.ppo.gamma,
-            gae_lambda=self.cfg.ppo.gae_lambda,
-            last_value=last_value,
-        )
+        env_batches: List[Dict[str, Any]] = []
+
+        for env_idx in range(self.num_envs):
+            env_batch = buffers[env_idx].compute_returns_and_advantages(
+                gamma=self.cfg.ppo.gamma,
+                gae_lambda=self.cfg.ppo.gae_lambda,
+                last_value=last_values[env_idx],
+            )
+            env_batches.append(env_batch)
+
+        batch = self._concat_rollout_batches(env_batches)
 
         batch["obs"] = {k: v.to(self.device) for k, v in batch["obs"].items()}
         batch["actions"] = batch["actions"].to(self.device)
@@ -363,12 +385,17 @@ class CombatTrainer:
         batch["returns"] = batch["returns"].to(self.device)
         batch["advantages"] = batch["advantages"].to(self.device)
 
+        # normalize advantages globalement sur tout le batch concaténé
+        adv_mean = batch["advantages"].mean()
+        adv_std = batch["advantages"].std(unbiased=False)
+        batch["advantages"] = (batch["advantages"] - adv_mean) / (adv_std + 1e-8)
+
         return {
             "batch": batch,
             "episode_rewards": episode_rewards,
             "episode_lengths": episode_lengths,
             "episode_wins": episode_wins,
-            "num_transitions": len(buffer),
+            "num_transitions": sum(len(buf) for buf in buffers),
             "potion_actions": potion_actions,
         }
 
@@ -464,6 +491,7 @@ class CombatTrainer:
         final_hp_ratios = []
         damage_taken_values = []
         potion_actions = 0
+        truncations = 0
 
         eval_seeds = [seed_start + i for i in range(num_episodes)]
 
@@ -497,6 +525,9 @@ class CombatTrainer:
                 state = next_state
                 last_info = info
 
+            if ep_len >= 500 and not done:
+                truncations += 1
+
             rewards.append(ep_reward)
             lengths.append(ep_len)
 
@@ -528,6 +559,7 @@ class CombatTrainer:
             "avg_win_len": avg_win_len,
             "potion_actions_total": float(potion_actions),
             "potion_actions_per_episode": float(potion_actions) / max(len(rewards), 1),
+            "truncations": truncations,
         }
 
     # -----------------------------------------------------

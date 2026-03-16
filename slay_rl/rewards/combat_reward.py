@@ -268,7 +268,6 @@ class CombatRewardCalculator:
             prev_state=prev_state,
             next_state=next_state,
             played_card_name=played_card_name,
-            action_type=action_type,
         )
 
         # -------------------------------------------------
@@ -286,10 +285,7 @@ class CombatRewardCalculator:
         # potion timing
         # -------------------------------------------------
         potion_use_penalty, potion_timing_reward = self._compute_potion_terms(
-            prev_state=prev_state,
-            next_state=next_state,
             action_type=action_type,
-            damage_dealt=damage_dealt,
             incoming_before=incoming_before,
             combat_won=combat_won,
         )
@@ -362,15 +358,20 @@ class CombatRewardCalculator:
     # =====================================================
 
     def _compute_step_penalty(
-        self,
-        action_info: Dict[str, Any],
-        combat_won: bool,
-        combat_lost: bool,
+            self,
+            action_info: Dict[str, Any],
+            combat_won: bool,
+            combat_lost: bool,
     ) -> float:
         if combat_won or combat_lost:
             return 0.0
 
         action_type = self._get_action_type(action_info)
+
+        # Cas neutre / action non renseignée dans certains tests
+        if action_type == "":
+            return 0.5 * self.r_cfg.end_turn_small_penalty
+
         penalty = self.r_cfg.end_turn_small_penalty
 
         if action_type == "wait":
@@ -452,22 +453,21 @@ class CombatRewardCalculator:
         # card-specific sequencing-friendly setup bonuses
         card = played_card_name.lower()
         if card == "inflame" and next_playable_attacks > 0:
-            reward += self.r_cfg.inflame_setup_scale * min(float(next_playable_attacks), 3.0)
+            reward += self.r_cfg.inflame_setup_scale * min(float(next_playable_attacks), 2.0)
         if card == "spot weakness" and next_playable_attacks > 0:
-            reward += self.r_cfg.spot_weakness_setup_scale * min(float(next_playable_attacks), 3.0)
+            reward += self.r_cfg.spot_weakness_setup_scale * min(float(next_playable_attacks), 2.0)
         if card == "rage" and next_playable_attacks > 0:
-            reward += self.r_cfg.rage_setup_scale * min(float(next_playable_attacks), 3.0)
+            reward += self.r_cfg.rage_setup_scale * min(float(next_playable_attacks), 2.0)
         if card == "double tap" and next_best_attack >= 8.0:
-            reward += self.r_cfg.double_tap_setup_scale * min(next_best_attack / 12.0, 2.5)
+            reward += self.r_cfg.double_tap_setup_scale * min(next_best_attack / 12.0, 1.5)
 
-        return reward
+        return min(reward, 0.20)
 
     def _compute_sequencing_reward(
-        self,
-        prev_state: Dict[str, Any],
-        next_state: Dict[str, Any],
-        played_card_name: str,
-        action_type: str,
+            self,
+            prev_state: Dict[str, Any],
+            next_state: Dict[str, Any],
+            played_card_name: str,
     ) -> float:
         reward = 0.0
 
@@ -475,44 +475,36 @@ class CombatRewardCalculator:
         next_double_tap = self._get_meta(next_state, "double_tap_charges")
 
         prev_rage = self._get_player_power(prev_state, "Rage")
-        next_rage = self._get_player_power(next_state, "Rage")
 
         attacks_before = self._get_meta(prev_state, "attacks_played_this_turn")
         attacks_after = self._get_meta(next_state, "attacks_played_this_turn")
 
-        cards_before = self._get_meta(prev_state, "cards_played_this_turn")
-        cards_after = self._get_meta(next_state, "cards_played_this_turn")
+        # bonus réduit si Double Tap a vraiment servi
+        if prev_double_tap > next_double_tap and attacks_after > attacks_before:
+            reward += 0.03
 
-        # bonus si une charge double tap a été consommée et qu'on a réellement avancé
-        if prev_double_tap > next_double_tap and (attacks_after > attacks_before):
-            reward += 0.10
-
-        # bonus si Rage existait déjà et l'action augmente les attaques jouées
+        # bonus réduit si Rage existait déjà et qu'on a effectivement attaqué
         if prev_rage > 0 and attacks_after > attacks_before:
-            reward += 0.04
+            reward += 0.015
 
-        # si on a joué une carte de setup puis qu'il reste encore du payoff dans la main suivante
+        # petit bonus si on a setup et qu'il reste du vrai payoff
         next_best_attack = self._estimate_best_attack_damage(next_state)
         next_playable_attacks = self._count_playable_attacks(next_state)
 
         card = played_card_name.lower()
         if card in {"inflame", "spot weakness", "rage", "double tap"}:
-            reward += 0.01 * min(float(next_playable_attacks), 3.0)
-            reward += 0.01 * min(next_best_attack / 10.0, 2.0)
-
-        # légère prime au vrai tempo de tour
-        if cards_after > cards_before:
-            reward += 0.003 * min(float(cards_after - cards_before), 3.0)
+            reward += 0.003 * min(float(next_playable_attacks), 3.0)
+            reward += 0.003 * min(next_best_attack / 10.0, 2.0)
 
         return reward
 
     def _compute_energy_reward(
-        self,
-        prev_state: Dict[str, Any],
-        next_state: Dict[str, Any],
-        action_type: str,
-        energy_before: float,
-        energy_after: float,
+            self,
+            prev_state: Dict[str, Any],
+            next_state: Dict[str, Any],
+            action_type: str,
+            energy_before: float,
+            energy_after: float,
     ) -> float:
         reward = 0.0
 
@@ -537,46 +529,31 @@ class CombatRewardCalculator:
         return reward
 
     def _compute_potion_terms(
-        self,
-        prev_state: Dict[str, Any],
-        next_state: Dict[str, Any],
-        action_type: str,
-        damage_dealt: float,
-        incoming_before: float,
-        combat_won: bool,
+            self,
+            action_type: str,
+            incoming_before: float,
+            combat_won: bool,
     ) -> tuple[float, float]:
-        potions_before = self._count_non_empty_potions(prev_state)
-        potions_after = self._count_non_empty_potions(next_state)
-        potions_used = max(0, potions_before - potions_after)
-
-        if potions_used <= 0 and action_type != "use_potion":
+        if action_type != "use_potion":
             return 0.0, 0.0
 
-        hp_ratio_before = self._get_player_hp(prev_state) / max(1.0, self._get_player_max_hp(prev_state))
-        lethal_candidates_before = self._count_near_lethal_enemies(prev_state, threshold=14.0)
-        lethal_candidates_after = self._count_near_lethal_enemies(next_state, threshold=14.0)
+        potion_use_penalty = 0.0
+        potion_timing_reward = 0.0
 
-        penalty = 0.0
-        timing_reward = 0.0
-
-        if incoming_before >= 16.0 or hp_ratio_before <= 0.35:
-            penalty += self.r_cfg.potion_high_threat_penalty * potions_used
-            timing_reward += self.r_cfg.potion_emergency_bonus * potions_used
-        elif incoming_before >= 8.0 or hp_ratio_before <= 0.55:
-            penalty += self.r_cfg.potion_medium_threat_penalty * potions_used
+        if incoming_before <= 6.0:
+            potion_use_penalty += self.r_cfg.potion_low_threat_penalty
+        elif incoming_before <= 14.0:
+            potion_use_penalty += self.r_cfg.potion_medium_threat_penalty
         else:
-            penalty += self.r_cfg.potion_low_threat_penalty * potions_used
+            potion_use_penalty += self.r_cfg.potion_high_threat_penalty
+
+        if incoming_before >= 16.0:
+            potion_timing_reward += self.r_cfg.potion_emergency_bonus
 
         if combat_won:
-            timing_reward += self.r_cfg.potion_lethal_bonus * potions_used
+            potion_timing_reward += self.r_cfg.potion_lethal_bonus
 
-        if damage_dealt >= 10.0:
-            timing_reward += 0.5 * self.r_cfg.potion_lethal_bonus * potions_used
-
-        if lethal_candidates_after < lethal_candidates_before:
-            timing_reward += 0.5 * self.r_cfg.potion_lethal_bonus * potions_used
-
-        return penalty, timing_reward
+        return potion_use_penalty, potion_timing_reward
 
     def _compute_lethal_reward(
         self,
