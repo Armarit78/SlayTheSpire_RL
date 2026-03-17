@@ -66,12 +66,10 @@ class RunController:
     def __init__(
         self,
         cfg: Optional[Config] = None,
-        mode: str = "mock",
         seed: int = 42,
         device: Optional[str] = None,
     ):
         self.cfg = cfg or get_default_config()
-        self.mode = mode
         self.seed = seed
 
         random.seed(seed)
@@ -84,7 +82,7 @@ class RunController:
                 device = "cpu"
         self.device = device
 
-        self.env = STSEnv(cfg=self.cfg, mode=mode, seed=seed)
+        self.env = STSEnv(cfg=self.cfg, seed=seed)
         self.model = CombatModel(cfg=self.cfg).to(self.device)
         self.agent = CombatAgent(self.model, cfg=self.cfg, device=self.device)
         self.rule_agent = RuleBasedCombatAgent(cfg=self.cfg)
@@ -298,7 +296,6 @@ def save_episode(result, episode_idx: int, mode: str):
     print(f"[episode saved] {path}")
 
 def run_game(
-    mode: str = "mock",
     agent_type: str = "rule",
     deterministic: bool = False,
     max_steps: int = 500,
@@ -306,7 +303,7 @@ def run_game(
     seed: int = 42,
 ) -> EpisodeResult:
     cfg = get_default_config()
-    controller = RunController(cfg=cfg, mode=mode, seed=seed)
+    controller = RunController(cfg=cfg, seed=seed)
 
     if agent_type == "model":
         return controller.run_episode_with_model(
@@ -333,7 +330,6 @@ def run_game(
 def quick_test() -> None:
     print("\n######## QUICK TEST: RULE AGENT ########")
     result = run_game(
-        mode="mock",
         agent_type="rule",
         deterministic=True,
         max_steps=100,

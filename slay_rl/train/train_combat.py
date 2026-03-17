@@ -135,13 +135,12 @@ class DummyVecCombatEnv:
         self,
         num_envs: int,
         cfg: Optional[Config] = None,
-        mode: str = "mock",
         seed: int = 42,
     ):
         self.cfg = cfg or get_default_config()
         self.num_envs = int(num_envs)
         self.envs = [
-            STSEnv(cfg=self.cfg, mode=mode, seed=seed + i)
+            STSEnv(cfg=self.cfg, seed=seed + i)
             for i in range(self.num_envs)
         ]
 
@@ -215,12 +214,10 @@ class CombatTrainer:
         self,
         cfg: Optional[Config] = None,
         device: Optional[str] = None,
-        mode: str = "mock",
         seed: int = 42,
     ):
         self.cfg = cfg or get_default_config()
         self.seed = seed
-        self.mode = mode
 
         random.seed(seed)
         torch.manual_seed(seed)
@@ -243,7 +240,6 @@ class CombatTrainer:
         self.vec_env = DummyVecCombatEnv(
             num_envs=self.num_envs,
             cfg=self.cfg,
-            mode=mode,
             seed=seed,
         )
 
@@ -536,7 +532,7 @@ class CombatTrainer:
         eval_seeds = [seed_start + i for i in range(num_episodes)]
 
         for episode_seed in eval_seeds:
-            eval_env = STSEnv(cfg=self.cfg, mode=self.mode, seed=episode_seed)
+            eval_env = STSEnv(cfg=self.cfg, seed=episode_seed)
 
             state = eval_env.reset()
             done = False
@@ -937,7 +933,7 @@ class CombatTrainer:
 
 def train_combat() -> List[TrainStats]:
     cfg = get_default_config()
-    trainer = CombatTrainer(cfg=cfg, mode="mock", seed=cfg.train.seed)
+    trainer = CombatTrainer(cfg=cfg, seed=cfg.train.seed)
     return trainer.train()
 
 

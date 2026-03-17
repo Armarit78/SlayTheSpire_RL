@@ -3342,37 +3342,13 @@ class MockGameBackend:
                 return int(p.get("amount", 0))
         return 0
 
-
-class LiveSpireBackend:
-    def __init__(self, cfg: Optional[Config] = None):
-        self.cfg = cfg or get_default_config()
-        self._last_state: Optional[Dict[str, Any]] = None
-
-    def reset(self) -> Dict[str, Any]:
-        raise NotImplementedError("LiveSpireBackend not wired to CommunicationMod yet.")
-
-    def get_state(self) -> Dict[str, Any]:
-        if self._last_state is None:
-            raise RuntimeError("No live state available yet.")
-        return copy.deepcopy(self._last_state)
-
-    def step(self, command: CombatCommand) -> Tuple[Dict[str, Any], bool]:
-        raise NotImplementedError("LiveSpireBackend.step() not wired yet.")
-
-
 class STSEnv:
-    def __init__(self, cfg: Optional[Config] = None, mode: str = "mock", seed: int = 42):
+    def __init__(self, cfg: Optional[Config] = None, seed: int = 42):
         self.cfg = cfg or get_default_config()
-        self.mode = mode
         self.seed = seed
         self.reward_calculator = CombatRewardCalculator(self.cfg)
 
-        if mode == "mock":
-            self.backend = MockGameBackend(self.cfg, seed=seed)
-        elif mode == "live":
-            self.backend = LiveSpireBackend(self.cfg)
-        else:
-            raise ValueError(f"Unknown mode: {mode}")
+        self.backend = MockGameBackend(self.cfg, seed=seed)
 
         self.state: Optional[Dict[str, Any]] = None
         self.turn: int = 0
