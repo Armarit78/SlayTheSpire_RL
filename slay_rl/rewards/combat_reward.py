@@ -188,9 +188,12 @@ class CombatRewardCalculator:
         overblock = max(0.0, player_block_after - max(0.0, incoming_before))
 
         block_reward = (
-            self.r_cfg.useful_block_scale * useful_block
-            + self.r_cfg.overblock_penalty_scale * min(overblock, 25.0)
+                self.r_cfg.useful_block_scale * useful_block
+                + self.r_cfg.overblock_penalty_scale * min(overblock, 25.0)
         )
+
+        if incoming_before <= 0.5 and block_gain > 0.0:
+            block_reward *= 0.25
 
         # -------------------------------------------------
         # threat reduction
@@ -461,7 +464,7 @@ class CombatRewardCalculator:
         if card == "double tap" and next_best_attack >= 8.0:
             reward += self.r_cfg.double_tap_setup_scale * min(next_best_attack / 12.0, 1.5)
 
-        return min(reward, 0.20)
+        return min(reward, 0.12)
 
     def _compute_sequencing_reward(
             self,
@@ -556,21 +559,27 @@ class CombatRewardCalculator:
         return potion_use_penalty, potion_timing_reward
 
     def _compute_lethal_reward(
-        self,
-        prev_state: Dict[str, Any],
-        next_state: Dict[str, Any],
-        damage_dealt: float,
+            self,
+            prev_state: Dict[str, Any],
+            next_state: Dict[str, Any],
+            damage_dealt: float,
     ) -> float:
         reward = 0.0
 
         prev_best_target_ehp = self._min_alive_enemy_effective_hp(prev_state)
         next_best_target_ehp = self._min_alive_enemy_effective_hp(next_state)
 
+        prev_alive = self._count_alive_enemies(prev_state)
+        next_alive = self._count_alive_enemies(next_state)
+
         if prev_best_target_ehp is not None and next_best_target_ehp is not None:
             if prev_best_target_ehp > 0 and next_best_target_ehp <= 0:
                 reward += self.r_cfg.lethal_reward_scale
             elif prev_best_target_ehp > 0 and next_best_target_ehp <= 8.0:
                 reward += self.r_cfg.near_lethal_reward_scale
+
+        if next_alive < prev_alive:
+            reward += 0.5 * self.r_cfg.lethal_reward_scale * float(prev_alive - next_alive)
 
         if damage_dealt >= 12.0:
             reward += 0.5 * self.r_cfg.near_lethal_reward_scale
