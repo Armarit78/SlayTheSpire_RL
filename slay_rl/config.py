@@ -401,9 +401,9 @@ class PPOConfig:
     gamma: float = 0.995
     gae_lambda: float = 0.97
     clip_eps: float = 0.2
-    value_coef: float = 0.25
-    entropy_coef: float = 0.012
-    lr: float = 2e-4
+    value_coef: float = 0.35
+    entropy_coef: float = 0.016
+    lr: float = 1.5e-4
     batch_size: int = 1024
     rollout_steps: int = 8192
     epochs: int = 4
@@ -420,6 +420,8 @@ class TrainConfig:
     save_every: int = 50
     log_every: int = 10
     eval_every: int = 20
+
+    max_episode_steps: int = 200
 
     eval_num_episodes: int = 50
     eval_seed_start: int = 100000

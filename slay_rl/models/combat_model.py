@@ -129,24 +129,41 @@ class SlotAttentionBlock(nn.Module):
         self.norm2 = nn.LayerNorm(hidden_dim)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        # key_padding_mask: True means ignore
-        key_padding_mask = mask <= 0.0
+        """
+        x:    [B, N, H]
+        mask: [B, N] with 1=valid, 0=invalid
 
-        attn_out, _ = self.attn(
-            query=x,
-            key=x,
-            value=x,
-            key_padding_mask=key_padding_mask,
-            need_weights=False,
-        )
-        x = self.norm1(x + attn_out)
+        Important:
+        MultiheadAttention can produce NaNs if an entire row is masked.
+        So we only run attention on rows that contain at least one valid token.
+        """
+        valid_rows = mask.sum(dim=1) > 0.0
+        out = torch.zeros_like(x)
 
-        ff_out = self.ff(x)
-        x = self.norm2(x + ff_out)
+        if valid_rows.any():
+            x_valid = x[valid_rows]
+            mask_valid = mask[valid_rows]
 
-        # zero-out invalid slots after attention for safety
-        x = x * mask.unsqueeze(-1).float()
-        return x
+            key_padding_mask = mask_valid <= 0.0
+
+            attn_out, _ = self.attn(
+                query=x_valid,
+                key=x_valid,
+                value=x_valid,
+                key_padding_mask=key_padding_mask,
+                need_weights=False,
+            )
+            x_valid = self.norm1(x_valid + attn_out)
+
+            ff_out = self.ff(x_valid)
+            x_valid = self.norm2(x_valid + ff_out)
+
+            x_valid = x_valid * mask_valid.unsqueeze(-1).float()
+            x_valid = torch.nan_to_num(x_valid, nan=0.0, posinf=0.0, neginf=0.0)
+
+            out[valid_rows] = x_valid
+
+        return out
 
 
 class CrossAttentionBlock(nn.Module):
@@ -177,28 +194,51 @@ class CrossAttentionBlock(nn.Module):
         self.norm2 = nn.LayerNorm(hidden_dim)
 
     def forward(
-        self,
-        left: torch.Tensor,
-        right: torch.Tensor,
-        left_mask: torch.Tensor,
-        right_mask: torch.Tensor,
+            self,
+            left: torch.Tensor,
+            right: torch.Tensor,
+            left_mask: torch.Tensor,
+            right_mask: torch.Tensor,
     ) -> torch.Tensor:
-        key_padding_mask = right_mask <= 0.0
+        """
+        left:       [B, N, H]
+        right:      [B, M, H]
+        left_mask:  [B, N]
+        right_mask: [B, M]
 
-        attn_out, _ = self.attn(
-            query=left,
-            key=right,
-            value=right,
-            key_padding_mask=key_padding_mask,
-            need_weights=False,
-        )
-        x = self.norm1(left + attn_out)
+        Important:
+        If a batch row has no valid right tokens, cross-attention can produce NaNs.
+        So we only run attention on rows where both sides have at least one valid token.
+        """
+        valid_rows = (left_mask.sum(dim=1) > 0.0) & (right_mask.sum(dim=1) > 0.0)
+        out = torch.zeros_like(left)
 
-        ff_out = self.ff(x)
-        x = self.norm2(x + ff_out)
+        if valid_rows.any():
+            left_valid = left[valid_rows]
+            right_valid = right[valid_rows]
+            left_mask_valid = left_mask[valid_rows]
+            right_mask_valid = right_mask[valid_rows]
 
-        x = x * left_mask.unsqueeze(-1).float()
-        return x
+            key_padding_mask = right_mask_valid <= 0.0
+
+            attn_out, _ = self.attn(
+                query=left_valid,
+                key=right_valid,
+                value=right_valid,
+                key_padding_mask=key_padding_mask,
+                need_weights=False,
+            )
+            x_valid = self.norm1(left_valid + attn_out)
+
+            ff_out = self.ff(x_valid)
+            x_valid = self.norm2(x_valid + ff_out)
+
+            x_valid = x_valid * left_mask_valid.unsqueeze(-1).float()
+            x_valid = torch.nan_to_num(x_valid, nan=0.0, posinf=0.0, neginf=0.0)
+
+            out[valid_rows] = x_valid
+
+        return out
 
 
 # =========================================================
@@ -722,27 +762,35 @@ class CombatModel(nn.Module):
         return mask
 
     def _apply_action_mask(
-        self,
-        logits: torch.Tensor,
-        valid_action_mask: torch.Tensor,
+            self,
+            logits: torch.Tensor,
+            valid_action_mask: torch.Tensor,
     ) -> torch.Tensor:
         """
         valid_action_mask: 1 for valid, 0 for invalid
+        Also protects against NaN / Inf contamination coming from upstream blocks.
         """
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=LOGIT_NEG)
         masked_logits = logits.masked_fill(valid_action_mask <= 0.0, LOGIT_NEG)
+
+        max_hand_cards = self.cfg.combat_obs.max_hand_cards
+        max_enemies = self.cfg.combat_obs.max_enemies
+        fallback_idx = max_hand_cards + max_hand_cards * max_enemies
+
+        if fallback_idx >= self.total_actions:
+            fallback_idx = 0
 
         invalid_rows = torch.all(valid_action_mask <= 0.0, dim=-1)
         if invalid_rows.any():
             masked_logits = masked_logits.clone()
-
-            max_hand_cards = self.cfg.combat_obs.max_hand_cards
-            max_enemies = self.cfg.combat_obs.max_enemies
-            fallback_idx = max_hand_cards + max_hand_cards * max_enemies
-
-            if fallback_idx >= self.total_actions:
-                fallback_idx = 0
-
+            masked_logits[invalid_rows] = LOGIT_NEG
             masked_logits[invalid_rows, fallback_idx] = 0.0
+
+        non_finite_rows = ~torch.isfinite(masked_logits).all(dim=-1)
+        if non_finite_rows.any():
+            masked_logits = masked_logits.clone()
+            masked_logits[non_finite_rows] = LOGIT_NEG
+            masked_logits[non_finite_rows, fallback_idx] = 0.0
 
         return masked_logits
 

@@ -8,7 +8,7 @@ def main():
     # CONFIG UTILISATEUR
     # =====================================================
 
-    mode = "play_model"
+    mode = "train"
     # modes possibles:
     # "play_rule"
     # "play_model"

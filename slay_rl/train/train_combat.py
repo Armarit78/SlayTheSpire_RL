@@ -29,6 +29,7 @@ class Transition:
     value: float
     reward: float
     done: bool
+    terminated: bool
 
 
 class RolloutBuffer:
@@ -52,7 +53,7 @@ class RolloutBuffer:
     ) -> Dict[str, torch.Tensor]:
         rewards = [t.reward for t in self.transitions]
         values = [t.value for t in self.transitions]
-        dones = [t.done for t in self.transitions]
+        terminateds = [t.terminated for t in self.transitions]
 
         advantages = [0.0 for _ in self.transitions]
         returns = [0.0 for _ in self.transitions]
@@ -61,7 +62,7 @@ class RolloutBuffer:
         next_value = last_value
 
         for t in reversed(range(len(self.transitions))):
-            mask = 0.0 if dones[t] else 1.0
+            mask = 0.0 if terminateds[t] else 1.0
             delta = rewards[t] + gamma * next_value * mask - values[t]
             gae = delta + gamma * gae_lambda * mask * gae
             advantages[t] = gae
@@ -106,6 +107,8 @@ class TrainStats:
     avg_episode_reward: float
     avg_episode_len: float
     win_rate: float
+    episodes_finished: int
+    truncations: int
     policy_loss: float
     value_loss: float
     entropy: float
@@ -118,6 +121,8 @@ class TrainStats:
             "avg_episode_reward": self.avg_episode_reward,
             "avg_episode_len": self.avg_episode_len,
             "win_rate": self.win_rate,
+            "episodes_finished": self.episodes_finished,
+            "truncations": self.truncations,
             "policy_loss": self.policy_loss,
             "value_loss": self.value_loss,
             "entropy": self.entropy,
@@ -143,6 +148,8 @@ class DummyVecCombatEnv:
             STSEnv(cfg=self.cfg, seed=seed + i)
             for i in range(self.num_envs)
         ]
+        self.episode_steps = [0 for _ in range(self.num_envs)]
+        self.max_episode_steps = int(self.cfg.train.max_episode_steps)
 
     def set_training_progress(self, update_idx: int) -> None:
         for env in self.envs:
@@ -150,24 +157,38 @@ class DummyVecCombatEnv:
                 env.set_training_progress(update_idx)
 
     def reset(self) -> List[Dict[str, Any]]:
+        self.episode_steps = [0 for _ in range(self.num_envs)]
         return [env.reset() for env in self.envs]
 
     def step(
-        self,
-        actions: List[int],
+            self,
+            actions: List[int],
     ) -> tuple[List[Dict[str, Any]], List[float], List[bool], List[Dict[str, Any]]]:
         next_states = []
         rewards = []
         dones = []
         infos = []
 
-        for env, action in zip(self.envs, actions):
+        for i, (env, action) in enumerate(zip(self.envs, actions)):
             next_state, reward, done, info = env.step(action)
 
+            self.episode_steps[i] += 1
+
+            info = dict(info)
+            terminated = bool(info.get("combat_won", False) or info.get("combat_lost", False))
+            truncated = False
+
+            if not done and self.episode_steps[i] >= self.max_episode_steps:
+                done = True
+                truncated = True
+
+            info["time_limit_truncated"] = truncated
+            info["terminated"] = bool(terminated or truncated)
+
             if done:
-                info = dict(info)
                 info["terminal_state"] = next_state
                 next_state = env.reset()
+                self.episode_steps[i] = 0
 
             next_states.append(next_state)
             rewards.append(reward)
@@ -192,10 +213,23 @@ class DummyVecCombatEnv:
                 forced_action_index=forced_idx,
             )
 
+            self.episode_steps[i] += 1
+
+            info = dict(info)
+            terminated = bool(info.get("combat_won", False) or info.get("combat_lost", False))
+            truncated = False
+
+            if not done and self.episode_steps[i] >= self.max_episode_steps:
+                done = True
+                truncated = True
+
+            info["time_limit_truncated"] = truncated
+            info["terminated"] = terminated
+
             if done:
-                info = dict(info)
                 info["terminal_state"] = next_state
                 next_state = env.reset()
+                self.episode_steps[i] = 0
 
             next_states.append(next_state)
             rewards.append(reward)
@@ -330,6 +364,7 @@ class CombatTrainer:
         episode_rewards: List[float] = []
         episode_lengths: List[int] = []
         episode_wins: List[int] = []
+        truncations = 0
 
         self.vec_env.set_training_progress(update_idx)
         states = self.current_states
@@ -373,6 +408,7 @@ class CombatTrainer:
                         value=values[env_idx],
                         reward=rewards[env_idx],
                         done=dones[env_idx],
+                        terminated=bool(infos[env_idx].get("terminated", False)),
                     )
                 )
 
@@ -383,6 +419,9 @@ class CombatTrainer:
                     episode_rewards.append(current_ep_rewards[env_idx])
                     episode_lengths.append(current_ep_lengths[env_idx])
                     episode_wins.append(1 if infos[env_idx].get("combat_won", False) else 0)
+
+                    if infos[env_idx].get("time_limit_truncated", False):
+                        truncations += 1
 
                     current_ep_rewards[env_idx] = 0.0
                     current_ep_lengths[env_idx] = 0
@@ -431,6 +470,8 @@ class CombatTrainer:
             "episode_rewards": episode_rewards,
             "episode_lengths": episode_lengths,
             "episode_wins": episode_wins,
+            "episodes_finished": len(episode_rewards),
+            "truncations": truncations,
             "num_transitions": sum(len(buf) for buf in buffers),
             "potion_actions": potion_actions,
         }
@@ -609,6 +650,14 @@ class CombatTrainer:
     # Train loop
     # -----------------------------------------------------
 
+    @staticmethod
+    def _fmt_metric(x: float, pct: bool = False, digits: int = 3) -> str:
+        if isinstance(x, float) and x != x:
+            return "n/a"
+        if pct:
+            return f"{100.0 * x:.2f}%"
+        return f"{x:.{digits}f}"
+
     def train(self) -> List[TrainStats]:
         stats_history: List[TrainStats] = []
 
@@ -636,28 +685,27 @@ class CombatTrainer:
             ep_rewards = rollout_out["episode_rewards"]
             ep_lengths = rollout_out["episode_lengths"]
             ep_wins = rollout_out["episode_wins"]
+            episodes_finished = int(rollout_out["episodes_finished"])
+            truncations = int(rollout_out["truncations"])
 
-            avg_episode_reward = (
-                sum(ep_rewards) / len(ep_rewards) if len(ep_rewards) > 0 else 0.0
-            )
-            avg_episode_len = (
-                sum(ep_lengths) / len(ep_lengths) if len(ep_lengths) > 0 else 0.0
-            )
-            win_rate = (
-                sum(ep_wins) / len(ep_wins) if len(ep_wins) > 0 else 0.0
-            )
+            avg_episode_reward = float(sum(ep_rewards) / len(ep_rewards)) if len(ep_rewards) > 0 else float("nan")
+            avg_episode_len = float(sum(ep_lengths) / len(ep_lengths)) if len(ep_lengths) > 0 else float("nan")
+            win_rate = float(sum(ep_wins) / len(ep_wins)) if len(ep_wins) > 0 else float("nan")
 
             stat = TrainStats(
                 update_idx=update_idx,
                 avg_episode_reward=avg_episode_reward,
                 avg_episode_len=avg_episode_len,
                 win_rate=win_rate,
+                episodes_finished=episodes_finished,
+                truncations=truncations,
                 policy_loss=metrics["policy_loss"],
                 value_loss=metrics["value_loss"],
                 entropy=metrics["entropy"],
                 approx_kl=metrics["approx_kl"],
                 clip_fraction=metrics["clip_fraction"],
             )
+
             stats_history.append(stat)
 
             eval_metrics = {
@@ -704,7 +752,7 @@ class CombatTrainer:
                         reward=self.best_eval_reward,
                     )
 
-            if update_idx % self.cfg.train.robust_eval_every == 0 or update_idx == 1:
+            if update_idx % self.cfg.train.robust_eval_every == 0:
                 robust_eval_metrics = self.evaluate(
                     num_episodes=self.cfg.train.robust_eval_num_episodes,
                     deterministic=True,
@@ -726,7 +774,7 @@ class CombatTrainer:
                         reward=self.best_robust_eval_reward,
                     )
 
-            if update_idx % self.cfg.train.robust_eval_every == 0 or update_idx == 1:
+            if update_idx % self.cfg.train.robust_eval_every == 0:
                 tqdm.write(
                     f"[robust_eval {update_idx}] "
                     f"avg_reward={robust_eval_metrics['avg_reward']:.3f} | "
@@ -735,13 +783,17 @@ class CombatTrainer:
                     f"avg_final_hp_ratio={robust_eval_metrics['avg_final_hp_ratio']:.3f} | "
                     f"avg_damage_taken={robust_eval_metrics['avg_damage_taken']:.2f} | "
                     f"avg_win_len={robust_eval_metrics['avg_win_len']:.2f} | "
-                    f"potion_actions_total={robust_eval_metrics['potion_actions_total']:.0f} | "
+                    f"potion_actions_total={robust_eval_metrics['potion_actions_total']} | "
                     f"potion_actions_per_episode={robust_eval_metrics['potion_actions_per_episode']:.2f}"
                 )
 
-            train_num_episodes = max(len(ep_rewards), 1)
+            train_num_episodes = len(ep_rewards)
             train_potion_actions_total = float(rollout_out["potion_actions"])
-            train_potion_actions_per_episode = train_potion_actions_total / train_num_episodes
+            train_potion_actions_per_episode = (
+                train_potion_actions_total / train_num_episodes
+                if train_num_episodes > 0
+                else float("nan")
+            )
 
             self._append_metrics_csv(
                 stat,
@@ -761,8 +813,10 @@ class CombatTrainer:
             eta_seconds = remaining_updates * avg_time_per_update
 
             pbar.set_postfix({
-                "reward": f"{avg_episode_reward:.2f}",
-                "win": f"{win_rate:.1%}",
+                "ep_fin": episodes_finished,
+                "trunc": truncations,
+                "reward": self._fmt_metric(avg_episode_reward, digits=2),
+                "win": self._fmt_metric(win_rate, pct=True),
                 "upd_s": f"{update_time:.1f}",
                 "eta_m": f"{eta_seconds / 60:.1f}",
             })
@@ -770,9 +824,11 @@ class CombatTrainer:
             if update_idx % self.cfg.train.log_every == 0 or update_idx == 1:
                 tqdm.write(
                     f"[update {update_idx}] "
-                    f"avg_reward={stat.avg_episode_reward:.3f} | "
-                    f"avg_len={stat.avg_episode_len:.2f} | "
-                    f"win_rate={stat.win_rate:.2%} | "
+                    f"episodes_finished={episodes_finished} | "
+                    f"truncations={truncations} | "
+                    f"avg_reward={self._fmt_metric(stat.avg_episode_reward)} | "
+                    f"avg_len={self._fmt_metric(stat.avg_episode_len, digits=2)} | "
+                    f"win_rate={self._fmt_metric(stat.win_rate, pct=True)} | "
                     f"policy_loss={stat.policy_loss:.4f} | "
                     f"value_loss={stat.value_loss:.4f} | "
                     f"entropy={stat.entropy:.4f} | "
@@ -892,6 +948,8 @@ class CombatTrainer:
             "train_avg_reward": stat.avg_episode_reward,
             "train_avg_len": stat.avg_episode_len,
             "train_win_rate": stat.win_rate,
+            "episodes_finished": stat.episodes_finished,
+            "truncations": stat.truncations,
             "policy_loss": stat.policy_loss,
             "value_loss": stat.value_loss,
             "entropy": stat.entropy,
